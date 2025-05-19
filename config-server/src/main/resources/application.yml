@@ -1,0 +1,15 @@
+server:
+  port: 8888
+
+spring:
+  cloud:
+    config:
+      server:
+        native:
+          search-locations: file:/app/config-repo
+      import-check:
+        enabled: false
+  profiles:
+    active: native
+# security:
+#   api-key: abc123xyzSecureKey

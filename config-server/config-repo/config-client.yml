@@ -1,0 +1,12 @@
+graphql:
+  endpoint: http://host.docker.internal:8080/content/cq:graphql/wknd/endpoint.json
+spring:
+  application:
+    name: config-client
+logging:
+  level:
+    com.wknd.spring.client.config_client: DEBUG
+security:
+  api-key: abc123xyzSecureKey
+api:
+  target-url: http://localhost:8081/products

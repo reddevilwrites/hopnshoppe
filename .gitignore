@@ -1,0 +1,18 @@
+# Root .gitignore
+.env
+.env.*
+docker_data/
+logs/
+*.log
+
+# Backend
+config-client/target/
+config-client/.idea/
+config-server/target/
+config-server/.idea/
+
+# Proxy/Frontend
+proxy/node_modules/
+aem-springboot-frontend/node_modules/
+aem-springboot-frontend/build/
+aem-springboot-frontend/dist/
