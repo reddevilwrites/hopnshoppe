@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: hopnshoppe-postgres
+    environment:
+      POSTGRES_DB: hopnshoppe
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "yhYgSr$Tfsh@89"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata-hopnshoppe:/var/lib/postgresql/data
+
+  config-server:
+    build: ./config-server
+    container_name: hopnshoppe-config-server
+    depends_on:
+      - postgres
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./config-server/config-repo:/app/config-repo:ro
+
+  config-client:
+    build: ./config-client
+    container_name: hopnshoppe-config-client
+    depends_on:
+      - config-server
+      - postgres
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/hopnshoppe
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "yhYgSr$Tfsh@89"
+      SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+    ports:
+      - "8081:8081"
+
+  proxy:
+    build: ./proxy
+    container_name: hopnshoppe-proxy
+    depends_on:
+      - config-client
+    environment:
+      TARGET_URL: http://config-client:8081/products
+      API_KEY: abc123xyzSecureKey
+    ports:
+      - "3000:3000"
+
+  frontend:
+    build: ./aem-springboot-frontend
+    container_name: hopnshoppe-frontend
+    depends_on:
+      - proxy
+    ports:
+      - "5173:80"
+    # calls proxy at http://localhost:3000 per current code
+
+volumes:
+  pgdata-hopnshoppe:

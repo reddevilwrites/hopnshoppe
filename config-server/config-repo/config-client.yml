@@ -1,5 +1,5 @@
 graphql:
-  endpoint: http://host.docker.internal:8080/content/cq:graphql/wknd/endpoint.json
+  endpoint: http://host.docker.internal:8080/content/_cq_graphql/wknd/endpoint.json
 spring:
   application:
     name: config-client
