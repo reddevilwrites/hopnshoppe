@@ -1,0 +1,85 @@
+# hopnshoppe
+
+A small e-commerce demo stack:
+
+- **config-server**: Spring Cloud Config server (port 8888) serving configs from `config-server/config-repo`.
+- **config-client**: Spring Boot backend (port 8081) fetching product data (GraphQL) and handling auth/account with Postgres.
+- **proxy**: Node/Express proxy (port 3000) forwarding product requests to the backend with CORS enabled.
+- **frontend**: React/Vite SPA built and served by nginx (port 5173).
+
+## Prerequisites
+- Docker + Docker Compose
+- Ports available: 5432, 8888, 8081, 3000, 5173 (adjust in `docker-compose.yml` if needed).
+- A `.env` file with your secrets (use `.env.example` as a template). Keep `.env` out of git.
+
+## Environment variables
+Create `.env` in the repo root (do not commit it):
+```
+POSTGRES_DB=hopnshoppe
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=replace_me_with_strong_password
+
+SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
+
+API_KEY=replace_me_with_api_key
+TARGET_URL=http://config-client:8081/products
+
+# Optional:
+# JWT_SECRET=replace_me_with_long_random_secret
+# GRAPHQL_ENDPOINT=http://host.docker.internal:8080/content/cq:graphql/wknd/endpoint.json
+```
+
+`docker-compose.yml` references these variables and will fail fast if required ones are missing.
+
+## Quick start (Docker Compose)
+From repo root:
+```bash
+docker compose up -d --build
+```
+
+Services:
+- Postgres: localhost:5432
+- Config server: http://localhost:8888/config-client.yml
+- Backend: http://localhost:8081/products
+- Proxy: http://localhost:3000/api/products
+- Frontend: http://localhost:5173
+
+Logs:
+```bash
+docker compose logs -f <service>
+# e.g., docker compose logs -f config-client
+```
+
+## Frontend routing
+Client-side routing is served via nginx with SPA fallback (`aem-springboot-frontend/nginx.conf`), so deep links like `/products` or `/login` work.
+
+## Local dev (optional)
+- Backend:
+  ```bash
+  cd config-client
+  ./mvnw spring-boot:run
+  ```
+  If running on host, set `spring.datasource.url=jdbc:postgresql://localhost:5432/${POSTGRES_DB}` and export `SPRING_DATASOURCE_PASSWORD`.
+
+- Proxy:
+  ```bash
+  cd proxy
+  npm install
+  TARGET_URL=http://localhost:8081/products API_KEY=${API_KEY} node index.js
+  ```
+
+- Frontend:
+  ```bash
+  cd aem-springboot-frontend
+  npm install
+  npm run dev
+  ```
+
+## Config locations
+- Backend config served from `config-server/config-repo/config-client.yml` (API key, target URL, GraphQL endpoint).
+- Database schema managed by JPA (`ddl-auto=update`).
+
+## Security notes
+- Do not commit real passwords, API keys, or JWT secrets. Keep them in `.env` (already gitignored).
+- Replace placeholder values in `.env` before running.
+- Rotate secrets for any public deployments.
