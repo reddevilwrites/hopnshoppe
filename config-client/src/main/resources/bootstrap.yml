@@ -3,5 +3,12 @@ spring:
     name: config-client
   cloud:
     config:
-      uri: http://host.docker.internal:8888
+      # Defaults to docker-compose service if env not provided
+      uri: ${SPRING_CLOUD_CONFIG_URI:http://config-server:8888}
       fail-fast: true
+      retry:
+        enabled: true
+        initial-interval: 2000
+        max-attempts: 6
+        max-interval: 5000
+        multiplier: 1.5
