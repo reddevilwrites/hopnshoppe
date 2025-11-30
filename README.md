@@ -23,10 +23,15 @@ SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
 
 API_KEY=replace_me_with_api_key
 TARGET_URL=http://config-client:8081/products
+BACKEND_BASE=http://config-client:8081
 
 # Optional:
 # JWT_SECRET=replace_me_with_long_random_secret
 # GRAPHQL_ENDPOINT=http://host.docker.internal:8080/content/cq:graphql/wknd/endpoint.json
+# SPRING_DATASOURCE_URL=jdbc:postgresql://<rds-endpoint>:5432/<db>
+# SPRING_DATASOURCE_USERNAME=<db-user>
+# SPRING_DATASOURCE_PASSWORD=<db-pass>
+# SPRING_PROFILES_ACTIVE=prod
 ```
 
 `docker-compose.yml` references these variables and will fail fast if required ones are missing.
@@ -43,6 +48,9 @@ Services:
 - Backend: http://localhost:8081/products
 - Proxy: http://localhost:3000/api/products
 - Frontend: http://localhost:5173
+
+Profiles:
+- Default is `local` (set in `application.yml`). For cloud/RDS, run the jar with `-Dspring.profiles.active=prod` and pass `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`.
 
 Logs:
 ```bash
@@ -77,7 +85,11 @@ Client-side routing is served via nginx with SPA fallback (`caas-frontend/nginx.
 
 ## Config locations
 - Backend config served from `config-server/config-repo/config-client.yml` (API key, target URL, GraphQL endpoint).
-- Database schema managed by JPA (`ddl-auto=update`).
+- Database schema managed by Flyway (migrations in `config-client/src/main/resources/db/migration`).
+
+## Flyway migrations
+- Initial schema: `V1__init.sql` creates `users` and `cart_items`.
+- `spring.jpa.hibernate.ddl-auto` is set to `validate` in profile-specific configs; Flyway handles migrations.
 
 ## Security notes
 - Do not commit real passwords, API keys, or JWT secrets. Keep them in `.env` (already gitignored).

@@ -3,10 +3,8 @@ spring:
     name: config-client   # same name used in config server
   config:
     import: configserver:http://config-server:8888
-
+  profiles:
+    active: local
 
 server:
   port: 8081
-logging:
-  level:
-    com.wknd.spring.client.config_client: DEBUG
