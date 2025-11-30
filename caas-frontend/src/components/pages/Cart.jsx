@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, Navigate, useNavigate } from "react-router-dom";
+import { API_BASE } from "../../api";
 
 const Cart = ({ token, onCartChange, onAuthFail }) => {
   const [items, setItems] = useState([]);
@@ -12,7 +13,7 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("http://localhost:3000/api/cart", {
+      const res = await fetch(`${API_BASE}/cart`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
@@ -41,7 +42,7 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
 
   const updateQuantity = async (sku, action) => {
     try {
-      const url = `http://localhost:3000/api/cart/${encodeURIComponent(
+      const url = `${API_BASE}/cart/${encodeURIComponent(
         sku
       )}/${action}`;
       const res = await fetch(url, {
@@ -65,7 +66,7 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
   const removeItem = async (sku) => {
     try {
       const res = await fetch(
-        `http://localhost:3000/api/cart/${encodeURIComponent(sku)}`,
+        `${API_BASE}/cart/${encodeURIComponent(sku)}`,
         {
           method: "DELETE",
           headers: { Authorization: `Bearer ${token}` },
@@ -143,7 +144,7 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
                 <div className="w-24 h-24 bg-gray-100 rounded-lg overflow-hidden">
                   {item.imagePath ? (
                     <img
-                      src={`http://localhost:8080${item.imagePath}`}
+                      src={item.imagePath}
                       alt={item.title}
                       className="w-full h-full object-cover"
                     />

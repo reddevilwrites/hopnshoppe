@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { API_BASE } from "../../api";
 
 const ProductList = ({token}) => {
   const [allProducts, setAllProducts] = useState([]);
@@ -10,7 +11,7 @@ const ProductList = ({token}) => {
   const productsPerPage = 6;
 
   useEffect(() => {
-    fetch("http://localhost:3000/api/products")
+    fetch(`${API_BASE}/products`)
       .then((res) => res.json())
       .then((data) => {
         setAllProducts(data);
@@ -66,7 +67,7 @@ const ProductList = ({token}) => {
               {p.imagePath && (
                 <img
                 loading="lazy"
-                src={`http://localhost:8080${p.imagePath}`}
+                src={p.imagePath}
                 alt={p.title}
                 className="w-full h-40 object-cover rounded"
                 />

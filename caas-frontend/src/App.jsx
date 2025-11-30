@@ -28,7 +28,7 @@ function App() {
       return;
     }
     try {
-      const res = await fetch("http://localhost:3000/api/cart", {
+      const res = await fetch("/api/cart", {
         headers: { "Authorization": `Bearer ${activeToken}` }
       });
       if (res.ok) {

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import axios from "axios";
+import { API_ROOT } from "../../api";
 
 export default function Signup() {
   const [form, setForm] = useState({
@@ -17,7 +18,7 @@ export default function Signup() {
         let isValidEmail = validateEmail(e.target[0].value);
         if(isValidEmail){
             try {
-                await axios.post("http://localhost:8081/auth/signup", form);
+                await axios.post(`${API_ROOT || ''}/auth/signup`, form);
                 setSuccess("Account created! You can now log in ");
                 setForm({ email: "", firstName: "", lastName: "", phone: "", password: "" });
                 } catch (err) {

@@ -46,8 +46,7 @@ Services:
 - Postgres: localhost:5432
 - Config server: http://localhost:8888/config-client.yml
 - Backend: http://localhost:8081/products
-- Proxy: http://localhost:3000/api/products
-- Frontend: http://localhost:5173
+- Frontend: http://localhost:5173 (nginx proxies `/api/*` to backend inside Compose)
 
 Profiles:
 - Default is `local` (set in `application.yml`). For cloud/RDS, run the jar with `-Dspring.profiles.active=prod` and pass `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`.
@@ -69,17 +68,11 @@ Client-side routing is served via nginx with SPA fallback (`caas-frontend/nginx.
   ```
   If running on host, set `spring.datasource.url=jdbc:postgresql://localhost:5432/${POSTGRES_DB}` and export `SPRING_DATASOURCE_PASSWORD`.
 
-- Proxy:
-  ```bash
-  cd proxy
-  npm install
-  TARGET_URL=http://localhost:8081/products API_KEY=${API_KEY} node index.js
-  ```
-
 - Frontend:
   ```bash
   cd caas-frontend
   npm install
+  # default: use /api; for local dev hitting backend directly set VITE_API_BASE=http://localhost:8081 VITE_API_ROOT=http://localhost:8081
   npm run dev
   ```
 

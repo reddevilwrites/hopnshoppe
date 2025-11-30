@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import axios from "axios";
+import { API_ROOT } from "../../api";
 
 export default function AccountPage() {
   const [profile, setProfile] = useState({
@@ -15,7 +16,7 @@ export default function AccountPage() {
     async function fetchProfile() {
       try {
         const token = sessionStorage.getItem("token");
-        const res = await axios.get("http://localhost:8081/account/me", {
+        const res = await axios.get(`${API_ROOT || ''}/account/me`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         setProfile(res.data);
@@ -36,7 +37,7 @@ export default function AccountPage() {
     e.preventDefault();
     try {
       const token = sessionStorage.getItem("token");
-      await axios.put("http://localhost:8081/account/me", profile, {
+      await axios.put(`${API_ROOT || ''}/account/me`, profile, {
         headers: { Authorization: `Bearer ${token}` },
       });
       setMessage("Profile updated!");

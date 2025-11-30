@@ -2,6 +2,7 @@ import axios from "axios";
 import { useState } from "react"
 import ShopperImage from "../../assets/images/shopper.jpg"
 import { Navigate } from "react-router-dom";
+import { API_ROOT } from "../../api";
 
 const Login = ({onLogin}) => {
 
@@ -13,7 +14,7 @@ const Login = ({onLogin}) => {
     const handleLogin = async (e) => {
         e.preventDefault();
         try {
-            const response = await axios.post("http://localhost:8081/auth/login",{
+            const response = await axios.post(`${API_ROOT || ''}/auth/login`,{
                 username,
                 password
             });

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { data, Link, useNavigate, useParams } from "react-router-dom"
+import { API_BASE } from "../../api";
 
 const ProductDetail = ({token, onCartChange, onAuthFail}) => {
     const {sku} = useParams();
@@ -9,7 +10,7 @@ const ProductDetail = ({token, onCartChange, onAuthFail}) => {
 
 
     useEffect(() => {
-        fetch(`http://localhost:3000/api/products/${sku}`)
+        fetch(`${API_BASE}/products/${sku}`)
         .then((res) => res.json())
         .then((data) => setProduct(data));
     },[sku])
@@ -20,7 +21,7 @@ const ProductDetail = ({token, onCartChange, onAuthFail}) => {
             return;
         }
         try {
-            const res = await fetch(`http://localhost:3000/api/cart/${sku}?quantity=1`, {
+            const res = await fetch(`${API_BASE}/cart/${sku}?quantity=1`, {
                 method: "POST",
                 headers: {
                     "Authorization": `Bearer ${token}`
@@ -59,7 +60,7 @@ const ProductDetail = ({token, onCartChange, onAuthFail}) => {
             <p>Category : {product.category}</p>
             {product.imagePath && (
                 <img
-                src={`http://localhost:8080${product.imagePath}`}
+                src={product.imagePath}
                 alt={product.title}
                 className="w-small h-40 w-60 object-cover rounded"/>
             )}
