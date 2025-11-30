@@ -51,7 +51,7 @@ docker compose logs -f <service>
 ```
 
 ## Frontend routing
-Client-side routing is served via nginx with SPA fallback (`aem-springboot-frontend/nginx.conf`), so deep links like `/products` or `/login` work.
+Client-side routing is served via nginx with SPA fallback (`caas-frontend/nginx.conf`), so deep links like `/products` or `/login` work.
 
 ## Local dev (optional)
 - Backend:
@@ -70,7 +70,7 @@ Client-side routing is served via nginx with SPA fallback (`aem-springboot-front
 
 - Frontend:
   ```bash
-  cd aem-springboot-frontend
+  cd caas-frontend
   npm install
   npm run dev
   ```

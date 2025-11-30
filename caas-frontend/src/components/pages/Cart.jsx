@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, Navigate, useNavigate } from "react-router-dom";
 
 const Cart = ({ token, onCartChange, onAuthFail }) => {
   const [items, setItems] = useState([]);
@@ -93,6 +93,10 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
       ),
     [items]
   );
+
+  const handleCheckout = () =>{
+    navigate("/checkout")
+  }
 
   return (
     <div className="max-w-6xl mx-auto px-6 py-10">
@@ -207,7 +211,7 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
               <span>Subtotal</span>
               <span className="font-semibold">₹{total.toFixed(2)}</span>
             </div>
-            <button className="w-full py-3 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 transition">
+            <button onClick={handleCheckout} className="w-full py-3 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 transition">
               Proceed to checkout
             </button>
           </aside>

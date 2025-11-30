@@ -29,6 +29,7 @@ public class SecurityConfig {
             .authorizeHttpRequests(authz -> authz
             .requestMatchers("/auth/**").permitAll()
             .requestMatchers("/products/**", "/products").permitAll()
+            .requestMatchers("/cart/**").authenticated()
             .anyRequest().permitAll()
             )
             .addFilterBefore(new JwtFilter(jwtUtil), UsernamePasswordAuthenticationFilter.class);

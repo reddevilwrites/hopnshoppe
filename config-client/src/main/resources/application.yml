@@ -2,7 +2,7 @@ spring:
   application:
     name: config-client   # same name used in config server
   config:
-    import: configserver:http://host.docker.internal:8888
+    import: configserver:http://config-server:8888
 
 
 server:

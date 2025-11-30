@@ -24,13 +24,21 @@ services:
       - "8888:8888"
     volumes:
       - ./config-server/config-repo:/app/config-repo:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8888/config-client.yml || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   config-client:
     build: ./config-client
     container_name: hopnshoppe-config-client
     depends_on:
-      - config-server
-      - postgres
+      config-server:
+        condition: service_healthy
+      postgres:
+        condition: service_started
     env_file:
       - .env
     environment:
@@ -51,11 +59,12 @@ services:
     environment:
       TARGET_URL: ${TARGET_URL:-http://config-client:8081/products}
       API_KEY: ${API_KEY:?API_KEY not set}
+      BACKEND_BASE: ${BACKEND_BASE:-http://config-client:8081}
     ports:
       - "3000:3000"
 
   frontend:
-    build: ./aem-springboot-frontend
+    build: ./caas-frontend
     container_name: hopnshoppe-frontend
     depends_on:
       - proxy

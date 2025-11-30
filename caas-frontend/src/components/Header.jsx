@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { FiMenu, FiX, FiShoppingCart, FiUser } from "react-icons/fi"; // lucide-react works similarly
 import { useNavigate } from "react-router-dom";
 
-export default function Header({ token, onLogout }) {
+export default function Header({ token, onLogout, cartCount = 0, userName = "" }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [dropDown, setDropDown] = useState(false);
   const ref = useRef();
@@ -50,8 +50,13 @@ export default function Header({ token, onLogout }) {
 
         {/* Right-side actions */}
         <div className="flex items-center space-x-4">
-          <a href="/cart" className="text-gray-700 hover:text-blue-600 transition">
+          <a href="/cart" className="relative text-gray-700 hover:text-blue-600 transition">
             <FiShoppingCart size={20} />
+            {cartCount > 0 && (
+              <span className="absolute -top-2 -right-3 bg-red-500 text-white text-xs rounded-full px-2 py-0.5">
+                {cartCount}
+              </span>
+            )}
           </a>
           {token ? (
             <button
@@ -59,7 +64,7 @@ export default function Header({ token, onLogout }) {
               className="flex items-center space-x-2 text-gray-700 hover:text-blue-600"
             >
               <FiUser size={20}/>
-              <span className="hidden md:inline">Account</span>
+              <span className="hidden md:inline">Hi{userName ? `, ${userName}` : ""}</span>
             </button>
           ) : (
             <a href="/login" className="text-gray-700 hover:text-blue-600 transition">

@@ -13,6 +13,6 @@ config-server/.idea/
 
 # Proxy/Frontend
 proxy/node_modules/
-aem-springboot-frontend/node_modules/
-aem-springboot-frontend/build/
-aem-springboot-frontend/dist/
+caas-frontend/node_modules/
+caas-frontend/build/
+caas-frontend/dist/
