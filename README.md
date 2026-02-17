@@ -1,6 +1,6 @@
 # hopnshoppe
 
-A small e-commerce demo stack:
+A small e-commerce demo stack utilizing Content As a Service:
 
 - **config-server**: Spring Cloud Config server (port 8888) serving configs from `config-server/config-repo`.
 - **config-client**: Spring Boot backend (port 8081) fetching product data (GraphQL) and handling auth/account with Postgres.
