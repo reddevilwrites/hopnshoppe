@@ -34,6 +34,19 @@ const ProductList = ({token}) => {
 
   const totalPages = Math.ceil(visibleProducts.length / productsPerPage);
 
+  const isLoading = allProducts.length === 0 && search === "";
+
+  const SkeletonCard = () => (
+    <div className="border rounded-lg p-4 shadow h-full space-y-3">
+      <div className="skeleton h-5 w-3/4" />
+      <div className="skeleton h-3 w-full" />
+      <div className="skeleton h-3 w-5/6" />
+      <div className="skeleton h-4 w-1/4 mt-1" />
+      <div className="skeleton h-3 w-1/3" />
+      <div className="skeleton h-40 w-full mt-2" />
+    </div>
+  );
+
   return (
     <div className="p-6">
       <h1 className="text-3xl font-bold mb-4">Products</h1>
@@ -47,35 +60,41 @@ const ProductList = ({token}) => {
       />
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-        {paginated.map((p) => (
-        <div key={p.sku} className="h-full">
-          <Link to={`/products/${p.sku}`}>
-            <div className="border rounded-lg p-4 shadow hover:shadow-lg transition h-full">
-              <h2 className="font-semibold text-xl mb-2">{p.title}</h2>
-              <p
-                className="text-gray-600 text-sm mb-2"
-                dangerouslySetInnerHTML={{ __html: p.description }}
-              />
-              <p className="font-bold text-lg text-blue-700 mb-1">₹{p.price}</p>
-              <p
-                className={`text-sm ${
-                  p.availability ? "text-green-600" : "text-red-600"
-                }`}
-              >
-                {p.availability ? "In Stock" : "Out of Stock"}
-              </p>
-              {p.imagePath && (
-                <img
-                loading="lazy"
-                src={p.imagePath}
-                alt={p.title}
-                className="w-full h-40 object-cover rounded"
+        {isLoading
+          ? Array.from({ length: productsPerPage }).map((_, i) => (
+              <div key={i} className="h-full">
+                <SkeletonCard />
+              </div>
+            ))
+          : paginated.map((p) => (
+          <div key={p.sku} className="h-full">
+            <Link to={`/products/${p.sku}`}>
+              <div className="border rounded-lg p-4 shadow hover:shadow-lg transition h-full">
+                <h2 className="font-semibold text-xl mb-2">{p.title}</h2>
+                <p
+                  className="text-gray-600 text-sm mb-2"
+                  dangerouslySetInnerHTML={{ __html: p.description }}
                 />
-              )}
+                <p className="font-bold text-lg text-blue-700 mb-1">₹{p.price}</p>
+                <p
+                  className={`text-sm ${
+                    p.availability ? "text-green-600" : "text-red-600"
+                  }`}
+                >
+                  {p.availability ? "In Stock" : "Out of Stock"}
+                </p>
+                {p.imagePath && (
+                  <img
+                  loading="lazy"
+                  src={p.imagePath}
+                  alt={p.title}
+                  className="w-full h-40 object-cover rounded"
+                  />
+                )}
+              </div>
+            </Link>
             </div>
-          </Link>
-          </div>
-        ))}
+          ))}
       </div>
 
       {/* Pagination */}

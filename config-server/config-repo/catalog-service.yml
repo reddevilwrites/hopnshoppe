@@ -1,0 +1,9 @@
+# GraphQL endpoint for the AEM CMS running on the Docker host.
+# host.docker.internal resolves to the host machine from inside a container.
+# AEM dispatcher is running on port 8090 locally.
+graphql:
+  endpoint: http://host.docker.internal:8090/content/_cq_graphql/wknd/endpoint.json
+
+logging:
+  level:
+    com.hopnshoppe.catalog: INFO

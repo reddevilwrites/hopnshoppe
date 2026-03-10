@@ -22,7 +22,13 @@ export default function Signup() {
                 setSuccess("Account created! You can now log in ");
                 setForm({ email: "", firstName: "", lastName: "", phone: "", password: "" });
                 } catch (err) {
-                setError(err.response?.data || "Registration failed");
+                const data = err.response?.data;
+                const message =
+                    (typeof data === 'string' ? data : data?.message) ||
+                    (err.response?.status === 409
+                    ? 'An account with this email already exists.'
+                    : 'Registration failed.');
+                setError(message);
                 }
         }
     }

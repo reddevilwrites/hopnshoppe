@@ -1,0 +1,149 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  application:
+    name: api-gateway
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+  cloud:
+    gateway:
+      # Enables integration between the gateway and the Eureka registry so that
+      # lb://service-name URIs are resolved to real instances via client-side load balancing.
+      discovery:
+        locator:
+          enabled: false   # Keep manual route definitions as the single source of truth.
+                           # Set to true only if you want auto-generated routes for every
+                           # registered service (useful for internal traffic, not public APIs).
+
+      routes:
+
+        # -----------------------------------------------------------------------
+        # auth-service: login and signup (public)
+        # Incoming:  POST /api/auth/login
+        #            POST /api/auth/signup
+        # Forwarded: POST /auth/login       (strips the leading /api segment)
+        #            POST /auth/signup
+        # -----------------------------------------------------------------------
+        - id: auth-service
+          uri: lb://auth-service
+          predicates:
+            - Path=/api/auth/**
+          filters:
+            - StripPrefix=1
+
+        # -----------------------------------------------------------------------
+        # user-service (by ID): fetch a user profile by numeric ID
+        # Incoming:  GET  /api/user/{id}
+        # Forwarded: GET  /users/{id}
+        #
+        # MUST be declared before the catch-all user-service route below,
+        # because Spring Cloud Gateway evaluates routes in declaration order
+        # and the first matching route wins.
+        # -----------------------------------------------------------------------
+        - id: user-service-by-id
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/{id}
+            - Method=GET
+          filters:
+            - RewritePath=/api/user/(?<id>[^/]+), /users/${id}
+
+        # -----------------------------------------------------------------------
+        # user-service: profile management (protected by JwtAuthenticationFilter)
+        # Incoming:  GET  /api/user/account/me
+        #            PUT  /api/user/account/me
+        # Forwarded: GET  /account/me      (strips /api/user, preserving the rest)
+        #            PUT  /account/me
+        #
+        # RewritePath is used instead of StripPrefix=2 because StripPrefix counts
+        # path segments, while RewritePath gives full regex control over the rewrite.
+        # -----------------------------------------------------------------------
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - RewritePath=/api/user(?<segment>/?.*), ${segment}
+
+        # -----------------------------------------------------------------------
+        # cart-service: cart management (JWT protected)
+        # Incoming:  GET  /api/cart
+        #            POST /api/cart/{sku}
+        # Forwarded: GET  /cart       (StripPrefix removes /api segment)
+        #            POST /cart/{sku}
+        # -----------------------------------------------------------------------
+        - id: cart-service
+          uri: lb://cart-service
+          predicates:
+            - Path=/api/cart/**
+          filters:
+            - StripPrefix=1
+
+        # -----------------------------------------------------------------------
+        # catalog-service: product listing (public — no JWT required)
+        # Incoming:  GET  /api/products
+        #            GET  /api/products/{sku}
+        # Forwarded: GET  /products
+        #            GET  /products/{sku}
+        # -----------------------------------------------------------------------
+        - id: catalog-service
+          uri: lb://catalog-service
+          predicates:
+            - Path=/api/products/**
+          filters:
+            - StripPrefix=1
+
+# ---------------------------------------------------------------------------
+# JWT — the secret MUST match the JWT_SECRET used by auth-service.
+# Both services read the same environment variable so they stay in sync.
+# ---------------------------------------------------------------------------
+jwt:
+  secret: ${JWT_SECRET}
+
+# ---------------------------------------------------------------------------
+# Public paths that bypass JwtAuthenticationFilter.
+# Evaluated as prefix matches — /api/auth covers /api/auth/login AND /api/auth/signup.
+# ---------------------------------------------------------------------------
+gateway:
+  public-paths:
+    - /api/auth
+    - /api/products
+    - /actuator
+
+# ---------------------------------------------------------------------------
+# Eureka client — registers the gateway and enables lb:// route resolution.
+# ---------------------------------------------------------------------------
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URI:http://discovery-server:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+    # Heartbeat and lease expiry intervals (seconds).
+    # Lower values = faster failure detection; higher values = less network overhead.
+    lease-renewal-interval-in-seconds: 10
+    lease-expiration-duration-in-seconds: 30
+
+# ---------------------------------------------------------------------------
+# Actuator — expose health and the live route table for debugging.
+# /actuator/gateway/routes shows every active route with predicates and filters.
+# ---------------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, gateway
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+    gateway:
+      enabled: true
+
+logging:
+  level:
+    org.springframework.cloud.gateway: INFO
+    com.hopnshoppe.gateway: DEBUG

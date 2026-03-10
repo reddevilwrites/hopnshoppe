@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.hopnshoppe</groupId>
+        <artifactId>hopnshoppe-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>common-library</artifactId>
+    <name>common-library</name>
+    <!--
+        Packaged as a plain JAR — not an executable Spring Boot fat JAR.
+        Services consume it as a regular Maven dependency.
+    -->
+    <packaging>jar</packaging>
+    <description>HopNShoppe shared DTOs and exception handlers</description>
+
+    <dependencies>
+
+        <!--
+            spring-boot-starter-web provides @RestControllerAdvice, ResponseEntity,
+            HttpStatus, and HttpServletRequest used by GlobalExceptionHandler.
+            Marked optional so this library does not force an embedded Tomcat onto
+            consumers that already have their own web starter on the classpath.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!--
+            Provides @Valid and Bean Validation annotations used in DTOs
+            and MethodArgumentNotValidException handling in GlobalExceptionHandler.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Lombok — version managed by parent -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+                Suppress the Spring Boot repackage goal for this module.
+                It has no main class and must remain a plain JAR so Maven
+                can resolve it as a regular dependency in other modules.
+            -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <skip>true</skip>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

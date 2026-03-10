@@ -1,0 +1,61 @@
+server:
+  port: 8084
+  shutdown: graceful
+
+spring:
+  application:
+    name: user-service
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+  # Pull additional config from config-server at startup. The optional: prefix
+  # means the service starts normally if config-server is unreachable (useful
+  # for running user-service in isolation during development).
+  config:
+    import: optional:configserver:${SPRING_CLOUD_CONFIG_URI:http://config-server:8888}
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/hopnshoppe_user_db}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      # validate: Hibernate checks entity mappings against the live schema.
+      # All DDL changes go through Flyway; Hibernate never modifies the schema.
+      ddl-auto: validate
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    show-sql: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+jwt:
+  # Must match the JWT_SECRET used by auth-service — both services share the
+  # same signing key so user-service can validate tokens without calling auth-service.
+  secret: ${JWT_SECRET}
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URI:http://discovery-server:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+    lease-renewal-interval-in-seconds: 10
+    lease-expiration-duration-in-seconds: 30
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+logging:
+  level:
+    com.hopnshoppe.user: DEBUG

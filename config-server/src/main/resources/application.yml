@@ -1,7 +1,10 @@
 server:
   port: 8888
+  shutdown: graceful
 
 spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
   cloud:
     config:
       server:
@@ -13,3 +16,14 @@ spring:
     active: native
 # security:
 #   api-key: abc123xyzSecureKey
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
