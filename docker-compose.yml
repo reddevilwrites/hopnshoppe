@@ -1,6 +1,9 @@
 version: "3.9"
 
 services:
+  # ---------------------------------------------------------------------------
+  # Legacy monolith database — kept for config-client; not used by microservices
+  # ---------------------------------------------------------------------------
   postgres:
     image: postgres:16
     container_name: hopnshoppe-postgres
@@ -15,6 +18,61 @@ services:
     volumes:
       - pgdata-hopnshoppe:/var/lib/postgresql/data
 
+  # ---------------------------------------------------------------------------
+  # auth-db — dedicated Postgres instance for auth-service (auth_db)
+  # Runs on host port 5434 to avoid colliding with postgres (5432) and user-db (5433).
+  # ---------------------------------------------------------------------------
+  auth-db:
+    image: postgres:16
+    container_name: hopnshoppe-auth-db
+    environment:
+      POSTGRES_DB: auth_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata-auth:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # user-db — dedicated Postgres instance for user-service (hopnshoppe_user_db)
+  # Runs on host port 5433 to avoid colliding with the legacy postgres on 5432.
+  # ---------------------------------------------------------------------------
+  user-db:
+    image: postgres:16
+    container_name: hopnshoppe-user-db
+    environment:
+      POSTGRES_DB: hopnshoppe_user_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata-user:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # Service Registry — all services register here; gateway resolves lb:// URIs
+  # ---------------------------------------------------------------------------
+  discovery-server:
+    build: ./discovery-server
+    container_name: hopnshoppe-discovery-server
+    ports:
+      - "8761:8761"
+    environment:
+      EUREKA_HOSTNAME: discovery-server
+    healthcheck:
+      # Eureka exposes /actuator/health via spring-boot-starter-actuator.
+      # start_period is generous because Eureka's context is slow to initialise.
+      test: ["CMD-SHELL", "curl -f http://localhost:8761/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Config Server — serves application configuration from config-repo/ files.
+  # Healthcheck verifies the native file-based backend is responding.
+  # ---------------------------------------------------------------------------
   config-server:
     build: ./config-server
     container_name: hopnshoppe-config-server
@@ -25,12 +83,177 @@ services:
     volumes:
       - ./config-server/config-repo:/app/config-repo:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8888/config-client.yml || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8888/auth-service.yml || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
 
+  # ---------------------------------------------------------------------------
+  # auth-service — credential storage and JWT issuance
+  # NOTE: config-client also uses host port 8081. Do not start both simultaneously.
+  # ---------------------------------------------------------------------------
+  auth-service:
+    build: ./auth-service
+    container_name: hopnshoppe-auth-service
+    depends_on:
+      discovery-server:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      auth-db:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://auth-db:5432/auth_db
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+      SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+      EUREKA_URI: http://discovery-server:8761/eureka/
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # user-service — profile management; registers with Eureka so auth-service
+  # can resolve it via Feign (lb://user-service)
+  # ---------------------------------------------------------------------------
+  user-service:
+    build: ./user-service
+    container_name: hopnshoppe-user-service
+    depends_on:
+      discovery-server:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      user-db:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://user-db:5432/hopnshoppe_user_db
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+      SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+      EUREKA_URI: http://discovery-server:8761/eureka/
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
+    ports:
+      - "8084:8084"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8084/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # API Gateway — single ingress; validates JWTs and routes to downstream services
+  # ---------------------------------------------------------------------------
+  api-gateway:
+    build: ./api-gateway
+    container_name: hopnshoppe-api-gateway
+    depends_on:
+      discovery-server:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
+      EUREKA_URI: http://discovery-server:8761/eureka/
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # cart-db — dedicated Postgres instance for cart-service (cart_db)
+  # Runs on host port 5435 to avoid colliding with other DB instances.
+  # ---------------------------------------------------------------------------
+  cart-db:
+    image: postgres:16
+    container_name: hopnshoppe-cart-db
+    environment:
+      POSTGRES_DB: cart_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+    ports:
+      - "5435:5432"
+    volumes:
+      - pgdata-cart:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # catalog-service — stateless GraphQL proxy to AEM CMS (no database)
+  # AEM dispatcher is expected on host port 8090 (host.docker.internal:8090).
+  # ---------------------------------------------------------------------------
+  catalog-service:
+    build: ./catalog-service
+    container_name: hopnshoppe-catalog-service
+    depends_on:
+      discovery-server:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+      EUREKA_URI: http://discovery-server:8761/eureka/
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # cart-service — cart state; calls catalog-service for product enrichment
+  # ---------------------------------------------------------------------------
+  cart-service:
+    build: ./cart-service
+    container_name: hopnshoppe-cart-service
+    depends_on:
+      discovery-server:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      cart-db:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://cart-db:5432/cart_db
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+      SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+      EUREKA_URI: http://discovery-server:8761/eureka/
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
+      CATALOG_SERVICE_URL: http://catalog-service:8083
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8082/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Legacy monolith — kept for reference during migration.
+  # NOTE: conflicts with auth-service on host port 8081. Do not start simultaneously.
+  # ---------------------------------------------------------------------------
   config-client:
     build: ./config-client
     container_name: hopnshoppe-config-client
@@ -49,14 +272,21 @@ services:
     ports:
       - "8081:8081"
 
+  # ---------------------------------------------------------------------------
+  # Frontend — React SPA served by nginx.
+  # nginx proxies /api/* and /auth/* to api-gateway:8080.
+  # ---------------------------------------------------------------------------
   frontend:
     build: ./caas-frontend
     container_name: hopnshoppe-frontend
     depends_on:
-      - config-client
+      api-gateway:
+        condition: service_healthy
     ports:
       - "5173:80"
-    # nginx proxies /api/* to config-client
 
 volumes:
   pgdata-hopnshoppe:
+  pgdata-auth:
+  pgdata-user:
+  pgdata-cart:

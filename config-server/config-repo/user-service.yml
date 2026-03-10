@@ -1,0 +1,6 @@
+# Config served to user-service by Spring Cloud Config Server.
+# Most configuration lives in user-service/src/main/resources/application.yml.
+
+logging:
+  level:
+    com.hopnshoppe.user: INFO

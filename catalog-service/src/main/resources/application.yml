@@ -1,0 +1,35 @@
+server:
+  port: 8083
+  shutdown: graceful
+
+spring:
+  application:
+    name: catalog-service
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+  config:
+    import: optional:configserver:${SPRING_CLOUD_CONFIG_URI:http://config-server:8888}
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URI:http://discovery-server:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+    lease-renewal-interval-in-seconds: 10
+    lease-expiration-duration-in-seconds: 30
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+logging:
+  level:
+    com.hopnshoppe.catalog: DEBUG

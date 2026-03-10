@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        Inheriting from spring-boot-starter-parent gives all child modules:
+          - Managed dependency versions from spring-boot-dependencies BOM
+          - Default plugin configuration (compiler, surefire, resources)
+          - Resource filtering for application*.yml/properties
+        This means child module POMs do NOT need a <parent> of spring-boot-starter-parent
+        themselves — they inherit everything through this reactor POM.
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.4.5</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.hopnshoppe</groupId>
+    <artifactId>hopnshoppe-parent</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>hopnshoppe-parent</name>
+    <description>HopNShoppe multi-module reactor parent</description>
+
+    <!--
+        Reactor module list. Maven builds these in declaration order,
+        respecting inter-module dependencies automatically.
+        common-library must be listed before any service that depends on it.
+    -->
+    <modules>
+        <!-- Infrastructure — must build before any business service -->
+        <module>common-library</module>
+        <module>discovery-server</module>
+        <module>api-gateway</module>
+        <!-- Business services -->
+        <module>auth-service</module>
+        <module>user-service</module>
+        <module>cart-service</module>
+        <module>catalog-service</module>
+        <!-- Uncomment as each service is scaffolded:
+        <module>config-server</module>
+        -->
+    </modules>
+
+    <properties>
+        <java.version>17</java.version>
+        <spring-cloud.version>2024.0.1</spring-cloud.version>
+        <!--
+            JJWT is NOT managed by spring-boot-dependencies, so we centralise
+            the version here so all services stay in sync.
+        -->
+        <jjwt.version>0.11.5</jjwt.version>
+        <!--
+            Spring Boot BOM manages Lombok but at an older patch; pin to 1.18.38
+            here so all services use the same release.
+        -->
+        <lombok.version>1.18.38</lombok.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+
+            <!--
+                Spring Cloud BOM: manages versions for Eureka, Resilience4j,
+                Spring Cloud Config, etc. Must align with Spring Boot 3.4.x.
+                Spring Cloud 2024.0.x → Spring Boot 3.4.x.
+            -->
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!--
+                common-library: shared DTOs and exception handlers.
+                Declaring it here means service POMs only need
+                <artifactId>common-library</artifactId> — no version to remember.
+            -->
+            <dependency>
+                <groupId>com.hopnshoppe</groupId>
+                <artifactId>common-library</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!-- JJWT — not in Spring Boot BOM, managed centrally here -->
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-api</artifactId>
+                <version>${jjwt.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-impl</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-jackson</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+
+            <!-- Override Spring Boot's managed Lombok version -->
+            <dependency>
+                <groupId>org.projectlombok</groupId>
+                <artifactId>lombok</artifactId>
+                <version>${lombok.version}</version>
+            </dependency>
+
+        </dependencies>
+    </dependencyManagement>
+
+    <!--
+        pluginManagement: child modules inherit these plugin configs automatically.
+        Services that are executable Spring Boot apps will repackage into fat JARs.
+        common-library overrides <skip>true</skip> to suppress repackaging
+        (it is a plain JAR consumed as a dependency, not an executable).
+    -->
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+
+</project>

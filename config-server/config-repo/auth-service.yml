@@ -1,0 +1,9 @@
+# Config served to auth-service by Spring Cloud Config Server.
+# Most configuration lives in auth-service/src/main/resources/application.yml.
+# Add environment-specific overrides here — they are merged on top at startup.
+
+logging:
+  level:
+    com.hopnshoppe.auth: INFO
+    io.github.resilience4j: INFO
+    org.springframework.cloud.openfeign: INFO

@@ -1,0 +1,45 @@
+server:
+  port: 8761
+  shutdown: graceful
+
+spring:
+  application:
+    name: discovery-server
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+eureka:
+  instance:
+    hostname: ${EUREKA_HOSTNAME:localhost}
+  client:
+    # A Eureka server does not register itself or fetch the registry from itself.
+    # Disable both to avoid startup warnings and self-registration loops.
+    register-with-eureka: false
+    fetch-registry: false
+    service-url:
+      defaultZone: http://${eureka.instance.hostname}:${server.port}/eureka/
+  server:
+    # Disables the 85%-threshold "self-preservation" mode that Eureka enters when it
+    # stops receiving heartbeats from many instances simultaneously (common during
+    # rolling restarts in dev). Safe to disable in development; re-enable in production
+    # to protect against spurious deregistrations under network partitions.
+    enable-self-preservation: false
+    # How long Eureka waits (ms) before evicting a client that has stopped sending
+    # heartbeats. Set low for fast feedback in dev; increase in production.
+    eviction-interval-timer-in-ms: 5000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+logging:
+  level:
+    com.netflix.eureka: WARN
+    com.netflix.discovery: WARN

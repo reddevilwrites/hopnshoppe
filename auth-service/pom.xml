@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        Inherits from the reactor parent, which itself inherits from spring-boot-starter-parent.
+        All Spring Boot, Spring Cloud, JJWT, and Lombok versions are managed there.
+        This POM declares ONLY what auth-service uniquely needs.
+    -->
+    <parent>
+        <groupId>com.hopnshoppe</groupId>
+        <artifactId>hopnshoppe-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>auth-service</artifactId>
+    <name>auth-service</name>
+    <description>HopNShoppe Auth Service — credential storage and JWT issuance</description>
+
+    <!-- No <properties> needed: java.version and spring-cloud.version inherited from parent -->
+
+    <dependencies>
+
+        <!-- ===== Shared library ===== -->
+        <!--
+            Provides UserDTO, ApiErrorDTO, and GlobalExceptionHandler.
+            Version is managed by the parent's dependencyManagement.
+        -->
+        <dependency>
+            <groupId>com.hopnshoppe</groupId>
+            <artifactId>common-library</artifactId>
+        </dependency>
+
+        <!-- ===== Web ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- ===== Security ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        <!--
+            spring-security-crypto is already pulled in transitively by
+            spring-boot-starter-security, but declaring it explicitly ensures
+            BCryptPasswordEncoder is available even if the security starter is
+            ever removed or scoped down.
+        -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+        </dependency>
+
+        <!-- ===== JWT (versions managed by parent) ===== -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+        </dependency>
+
+        <!-- ===== Persistence ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ===== Flyway ===== -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ===== Validation ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- ===== Spring Cloud Config (fetch config from config-server) ===== -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-config</artifactId>
+        </dependency>
+
+        <!-- ===== OpenFeign — declarative REST client for user-service calls ===== -->
+        <!--
+            @FeignClient(name = "user-service") in UserServiceFeignClient resolves
+            to a real instance via Eureka + Spring Cloud LoadBalancer. No URL
+            configuration required — service discovery handles it.
+            Version managed by Spring Cloud BOM.
+        -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-openfeign</artifactId>
+        </dependency>
+
+        <!-- ===== Service Discovery — Eureka Client ===== -->
+        <!--
+            Registers auth-service with Eureka at startup and maintains a heartbeat.
+            Other services resolve "auth-service" by name via client-side load balancing
+            instead of hardcoded host:port. Requires a running Eureka server and:
+
+              eureka.client.service-url.defaultZone=http://eureka-server:8761/eureka/
+        -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+        </dependency>
+
+        <!-- ===== Circuit Breaker — Resilience4j ===== -->
+        <!--
+            Wraps outgoing RestTemplate calls (e.g. auth-service → user-service during signup)
+            in a circuit breaker. If user-service is down, the circuit opens and a fallback
+            is executed instead of blocking the thread with repeated failures.
+
+            Transitively includes resilience4j-micrometer, which publishes circuit state
+            (OPEN/CLOSED/HALF_OPEN, call counts, failure rates) to /actuator/metrics
+            automatically. Configure per-instance in application.yml:
+
+              resilience4j.circuitbreaker.instances.user-service:
+                sliding-window-size: 10
+                failure-rate-threshold: 50
+                wait-duration-in-open-state: 10s
+        -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-circuitbreaker-resilience4j</artifactId>
+        </dependency>
+
+        <!-- ===== Actuator (foundation for all observability) ===== -->
+        <!--
+            Exposes:  /actuator/health       → Docker/k8s healthchecks
+                      /actuator/metrics      → Micrometer metric registry
+                      /actuator/prometheus   → Prometheus scrape endpoint (via registry below)
+                      /actuator/circuitbreakers → Resilience4j state
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- ===== Distributed Tracing — Micrometer + OpenTelemetry + Zipkin ===== -->
+        <!--
+            micrometer-tracing-bridge-otel:
+              Wires the Micrometer Tracing abstraction (the Spring Boot 3 standard) to the
+              OpenTelemetry SDK. Traces are automatically added to incoming HTTP requests and
+              propagated to outgoing RestTemplate/WebClient calls via standard W3C headers
+              (traceparent, tracestate). No code changes required.
+              Version managed by spring-boot-dependencies BOM — do not pin manually.
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
+        <!--
+            opentelemetry-exporter-zipkin:
+              Ships completed spans to a Zipkin server over HTTP.
+              Configure the endpoint in application.yml:
+
+                management.zipkin.tracing.endpoint=http://zipkin:9411/api/v2/spans
+
+              To send to a different backend (Jaeger, Tempo), swap this for
+              opentelemetry-exporter-otlp and update the endpoint accordingly.
+              Version managed by spring-boot-dependencies BOM.
+        -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-zipkin</artifactId>
+        </dependency>
+        <!--
+            micrometer-registry-prometheus:
+              Exposes /actuator/prometheus in Prometheus text format so a Prometheus
+              scraper or Grafana Agent can pull the full metrics set (JVM, HTTP request
+              latencies, Resilience4j circuit state, etc.).
+              Version managed by spring-boot-dependencies BOM.
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- ===== Lombok (version managed by parent) ===== -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- ===== Test ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <!-- No <dependencyManagement> here — fully inherited from hopnshoppe-parent -->
+
+    <build>
+        <plugins>
+            <!--
+                Repackages the JAR into a fat executable JAR during the package phase.
+                Config inherited from parent's pluginManagement; declared here so
+                Spring Boot plugin is active for this module.
+            -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

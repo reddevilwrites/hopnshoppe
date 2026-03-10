@@ -1,18 +1,85 @@
-# Root .gitignore
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets & local overrides
+# ─────────────────────────────────────────────────────────────────────────────
 .env
 .env.*
+*.local
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Maven build output (all modules)
+# ─────────────────────────────────────────────────────────────────────────────
+**/target/
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDE — IntelliJ IDEA
+# ─────────────────────────────────────────────────────────────────────────────
+**/.idea/
+*.iml
+*.iws
+*.ipr
+
+# IDE — Eclipse / Spring Tool Suite
+**/.classpath
+**/.project
+**/.settings/
+**/.springBeans
+**/.sts4-cache
+**/.apt_generated
+**/.factorypath
+
+# IDE — VS Code (keep shared extensions list)
+.vscode/*
+!.vscode/extensions.json
+
+# IDE — NetBeans
+nbproject/private/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker
+# ─────────────────────────────────────────────────────────────────────────────
 docker_data/
+docker-compose.override.yml
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────────────────────────────────────────
 logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Backend
-config-client/target/
-config-client/.idea/
-config-server/target/
-config-server/.idea/
-
-# Proxy/Frontend
-proxy/node_modules/
-caas-frontend/node_modules/
-caas-frontend/build/
+# ─────────────────────────────────────────────────────────────────────────────
+# Node / Frontend
+# ─────────────────────────────────────────────────────────────────────────────
+**/node_modules/
 caas-frontend/dist/
+caas-frontend/build/
+
+# Playwright artefacts (also covered by caas-frontend/.gitignore)
+caas-frontend/playwright-report/
+caas-frontend/test-results/
+caas-frontend/e2e/.test-accounts.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OS-generated files
+# ─────────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Miscellaneous
+# ─────────────────────────────────────────────────────────────────────────────
+*.orig
+**/HELP.md
