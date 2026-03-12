@@ -1,11 +1,16 @@
 package com.hopnshoppe.cart.client;
 
 import com.hopnshoppe.cart.dto.ProductDTO;
+import com.hopnshoppe.common.dto.UnifiedProductDTO;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * REST client for catalog-service product lookups.
@@ -35,6 +40,40 @@ public class CatalogClient {
         } catch (Exception e) {
             logger.warn("Failed to fetch product {} from catalog-service: {}", sku, e.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * Fetches a product by ID from the unified endpoint, which resolves from either
+     * AEM or MARKETPLACE. Returns {@code null} on 404 or any network failure.
+     */
+    public UnifiedProductDTO getUnifiedProductById(String id) {
+        try {
+            return restTemplate.getForObject(
+                    catalogServiceUrl + "/products/unified/" + id,
+                    UnifiedProductDTO.class);
+        } catch (Exception e) {
+            logger.warn("Failed to fetch unified product {} from catalog-service: {}", id, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Batch-fetches multiple products by ID in a single HTTP call.
+     * Replaces N individual calls in cart enrichment, reducing latency from O(N) to O(1).
+     * Returns an empty list on any network failure so callers can degrade gracefully.
+     */
+    public List<UnifiedProductDTO> getUnifiedProductsByIds(List<String> ids) {
+        if (ids == null || ids.isEmpty()) return Collections.emptyList();
+        try {
+            String idsParam = String.join(",", ids);
+            UnifiedProductDTO[] products = restTemplate.getForObject(
+                    catalogServiceUrl + "/products/unified/batch?ids=" + idsParam,
+                    UnifiedProductDTO[].class);
+            return products != null ? Arrays.asList(products) : Collections.emptyList();
+        } catch (Exception e) {
+            logger.warn("Failed to batch-fetch products from catalog-service: {}", e.getMessage());
+            return Collections.emptyList();
         }
     }
 }

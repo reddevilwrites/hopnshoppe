@@ -77,7 +77,7 @@ spring:
         - id: cart-service
           uri: lb://cart-service
           predicates:
-            - Path=/api/cart/**
+            - Path=/api/cart,/api/cart/**
           filters:
             - StripPrefix=1
 
@@ -92,6 +92,21 @@ spring:
           uri: lb://catalog-service
           predicates:
             - Path=/api/products/**
+          filters:
+            - StripPrefix=1
+
+        # -----------------------------------------------------------------------
+        # search-service: hybrid semantic search (public — no JWT required)
+        # Incoming:  GET  /api/search?q=...
+        # Forwarded: GET  /search?q=...
+        #
+        # search-service is a Python FastAPI container (not Eureka-registered),
+        # so we route directly by container name instead of lb://search-service.
+        # -----------------------------------------------------------------------
+        - id: search-service
+          uri: http://search-service:8085
+          predicates:
+            - Path=/api/search/**
           filters:
             - StripPrefix=1
 
@@ -110,6 +125,7 @@ gateway:
   public-paths:
     - /api/auth
     - /api/products
+    - /api/search
     - /actuator
 
 # ---------------------------------------------------------------------------

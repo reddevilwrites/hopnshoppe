@@ -136,16 +136,23 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           <div className="lg:col-span-2 space-y-4">
-            {items.map((item) => (
+            {items.map((item) => {
+              // Normalise field names: CartItemDTO uses title/imagePath (AEM);
+              // future unified enrichment may use name/imageUrl (MARKETPLACE)
+              const displayName = item.title || item.name || item.sku;
+              const displayImage = item.imagePath || item.imageUrl;
+              const hasAvailability = item.availability !== null && item.availability !== undefined;
+
+              return (
               <div
                 key={item.sku}
                 className="flex gap-4 bg-white border border-gray-200 rounded-xl shadow-sm p-4"
               >
                 <div className="w-24 h-24 bg-gray-100 rounded-lg overflow-hidden">
-                  {item.imagePath ? (
+                  {displayImage ? (
                     <img
-                      src={item.imagePath}
-                      alt={item.title}
+                      src={displayImage}
+                      alt={displayName}
                       className="w-full h-full object-cover"
                     />
                   ) : (
@@ -157,15 +164,17 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
                 <div className="flex-1 flex flex-col">
                   <div className="flex justify-between">
                     <div>
-                      <h3 className="text-lg font-semibold">{item.title}</h3>
+                      <h3 className="text-lg font-semibold">{displayName}</h3>
                       <p className="text-sm text-gray-500">SKU: {item.sku}</p>
-                      <p
-                        className={`text-xs mt-1 ${
-                          item.availability ? "text-green-600" : "text-red-600"
-                        }`}
-                      >
-                        {item.availability ? "In stock" : "Out of stock"}
-                      </p>
+                      {hasAvailability && (
+                        <p
+                          className={`text-xs mt-1 ${
+                            item.availability ? "text-green-600" : "text-red-600"
+                          }`}
+                        >
+                          {item.availability ? "In stock" : "Out of stock"}
+                        </p>
+                      )}
                     </div>
                     <button
                       onClick={() => removeItem(item.sku)}
@@ -194,12 +203,13 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
                       </button>
                     </div>
                     <div className="text-lg font-semibold text-blue-700">
-                      ₹{(item.price || 0).toFixed(2)}
+                      ${(item.price || 0).toFixed(2)}
                     </div>
                   </div>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
 
           <aside className="bg-white border border-gray-200 rounded-xl shadow-sm p-6 h-fit">
@@ -210,7 +220,7 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
             </div>
             <div className="flex justify-between text-gray-700 mb-4">
               <span>Subtotal</span>
-              <span className="font-semibold">₹{total.toFixed(2)}</span>
+              <span className="font-semibold">${total.toFixed(2)}</span>
             </div>
             <button onClick={handleCheckout} className="w-full py-3 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 transition">
               Proceed to checkout

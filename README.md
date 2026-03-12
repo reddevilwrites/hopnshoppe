@@ -1,6 +1,6 @@
 # hopnshoppe
 
-A full-stack e-commerce demo built on a **microservices architecture** with Content-as-a-Service (AEM CMS).
+A full-stack e-commerce demo built on a **microservices architecture** with aggregating catalog data from multiple sources such Content-as-a-Service (AEM CMS), PIM (REST),  legacy applications(SOAP based) and semantic product search powered by pgvector.
 
 ## Services
 
@@ -12,16 +12,21 @@ A full-stack e-commerce demo built on a **microservices architecture** with Cont
 | auth-service | 8081 | Login / signup / JWT issuance |
 | user-service | 8084 | User profile management |
 | cart-service | 8082 | Cart state (database-per-service) |
-| catalog-service | 8083 | Stateless GraphQL proxy to AEM CMS |
+| catalog-service | 8083 | Product aggregator — AEM GraphQL + DummyJSON Marketplace |
+| search-service | 8085 | Semantic + full-text product search (FastAPI + pgvector) |
+| ingestion-worker | — | Kafka consumer; generates embeddings and writes to search-db |
 | frontend | 5173→80 | React 19 SPA served by nginx |
 | auth-db | 5433 | PostgreSQL — credentials |
 | user-db | 5434 | PostgreSQL — user profiles |
 | cart-db | 5435 | PostgreSQL — cart items |
+| search-db | 5436 | PostgreSQL + pgvector — search index |
+
+> **Legacy monolith (`config-client`) has been deactivated.** Source files are preserved in the repository under `config-client/` but the service is excluded from the Maven build and Docker Compose. See `config-client/DEPRECATED.md`.
 
 ## Prerequisites
 - Docker + Docker Compose
 - Maven 3.9+ (for building JARs)
-- Ports available: 5433–5435, 8080–8084, 8761, 8888, 5173
+- Ports available: 5433–5436, 8080–8085, 8761, 8888, 5173
 - A `.env` file with secrets (use `.env.example` as a template — keep `.env` out of git)
 
 ## Environment variables
@@ -39,6 +44,8 @@ JWT_SECRET=replace_me_with_long_random_secret
 
 `docker-compose.yml` will fail fast (`?` syntax) if required variables are missing.
 
+Search-service DB credentials are passed directly via `docker-compose.yml` environment blocks (not `.env`) and reuse `POSTGRES_PASSWORD`.
+
 ## Quick start
 ```bash
 # 1. Build all JARs
@@ -55,6 +62,7 @@ Service endpoints:
 - Eureka dashboard: http://localhost:8761
 - Config server: http://localhost:8888/auth-service.yml
 - Frontend: http://localhost:5173
+- Search API: http://localhost:8085/search?q=running+shoes
 
 Logs:
 ```bash
@@ -65,16 +73,70 @@ docker compose logs -f <service-name>
 
 ### Request flow
 ```
-Browser → nginx (:5173) ─→ /api/* ─→ api-gateway (:8080) ─→ lb://service → service
-                          → /content/* → AEM dispatcher (host.docker.internal:8090)
+Browser → nginx (:5173) ─→ /api/*        → api-gateway (:8080) → lb://service → service
+                          → /api/search/* → search-service (:8085) [no JWT required]
+                          → /content/*   → AEM dispatcher (host.docker.internal:8090)
 ```
 
 ### Inter-service calls
-- **auth-service → user-service** (`POST /internal/users`) during signup with compensating rollback
-- **cart-service → catalog-service** (`GET /products/{sku}`) for product enrichment
+| Caller | Callee | Endpoint | When |
+|---|---|---|---|
+| auth-service | user-service | `POST /internal/users` | Signup — with compensating rollback on failure |
+| cart-service | catalog-service | `GET /products/unified/batch?ids=...` | Enrich cart DTOs with product data (AEM + Marketplace) |
+
+### Product catalog
+`catalog-service` aggregates products from two sources in parallel:
+
+| Source | Type | ID Format |
+|---|---|---|
+| **AEM** (`source=AEM`) | Adobe Experience Manager content fragments via GraphQL | String SKU |
+| **MARKETPLACE** (`source=MARKETPLACE`) | DummyJSON external API | String-encoded integer |
+
+Unified products are served at `GET /api/products/unified`. Individual lookup at `GET /api/products/unified/{id}` tries AEM first, then DummyJSON for numeric IDs.
+
+### Semantic search pipeline
+```
+catalog-service ──Kafka──▶ product-updates topic ──▶ ingestion-worker
+                                                           │
+                                          SentenceTransformer (all-MiniLM-L6-v2)
+                                                           │
+                                                       search-db (pgvector)
+                                                     search_index table
+                                                           │
+                                                    search-service (FastAPI)
+                                                    GET /search?q=...
+```
+
+**`search_index` schema (one row per product):**
+- `product_id TEXT PRIMARY KEY`
+- `embedding VECTOR(384)` — HNSW index (cosine similarity)
+- `search_text TEXT` — GIN tsvector index for full-text search
+- `denormalized_doc JSONB` — complete product card data (no follow-up hydration needed)
+- `price_amount`, `currency`, `in_stock`, `updated_at`
+
+**Hybrid ranking:** Top-100 vector candidates (HNSW) joined with full-text candidates (GIN). Final score = `vector_score × 0.7 + text_score × 0.3`.
+
+**Kafka event types (topic: `product-updates`):**
+- `FULL_UPDATE` — rebuilds doc + embedding. Absent `eventType` defaults to `FULL_UPDATE` (backward-compatible with catalog-service publishing plain `UnifiedProductDTO`).
+- `PRICE_UPDATE` — patches price/stock fields via `jsonb_set`; skips embedding regeneration.
+
+Dead-letter queue: `product-updates.DLQ` for events that fail DB writes after retries.
+
+### Frontend search (Header)
+- 300ms debounced input + AbortController (cancels in-flight requests on each keystroke)
+- Results rendered as an inline dropdown with title and formatted price from `denormalized_doc`
+- Clicking a result uses React Router `<Link to>` for client-side navigation (preserves state, avoids full-page reload)
+- No follow-up catalog-service fetch per result — all card data is in `denormalized_doc`
 
 ### Database-per-service
 Each stateful service owns its Postgres instance. No cross-database foreign keys — `cart_items` references users by `user_email` string.
+
+| DB | Service | Key tables |
+|---|---|---|
+| auth-db (:5433) | auth-service | `credentials` |
+| user-db (:5434) | user-service | `user_profiles` |
+| cart-db (:5435) | cart-service | `cart_items` |
+| search-db (:5436) | search-service + ingestion-worker | `search_index` (pgvector) |
 
 ## Cloud-Readiness (12-Factor)
 
@@ -82,7 +144,7 @@ Each stateful service owns its Postgres instance. No cross-database foreign keys
 |---|---|---|
 | Config Externalization | ✅ | All secrets via `${ENV_VAR}`, no hardcoded values |
 | Graceful Shutdown | ✅ | `server.shutdown=graceful` + 30s phase timeout on all services |
-| K8s Health Probes | ✅ | `/actuator/health/liveness` and `/actuator/health/readiness` enabled on all services |
+| K8s Health Probes | ✅ | `/actuator/health/liveness` and `/actuator/health/readiness` on all Spring services |
 | Non-root containers | ✅ | All Dockerfiles run as `appuser` (system account) |
 | STDOUT logging | ✅ | Spring Boot default; no file appenders |
 | Stateless services | ✅ | JWT auth, no sticky sessions, no local filesystem writes |
@@ -107,7 +169,7 @@ readinessProbe:
 
 Each microservice becomes its own ECS task definition. General pattern:
 
-1. Create separate RDS instances (or schemas) for auth, user, and cart databases.
+1. Create separate RDS instances (or schemas) for auth, user, cart, and search databases.
 2. Store DB credentials and `JWT_SECRET` in AWS Secrets Manager.
 3. Build and push each service image to ECR:
    ```bash
@@ -118,6 +180,7 @@ Each microservice becomes its own ECS task definition. General pattern:
 4. Create ECS task definitions with env vars mapped from Secrets Manager.
 5. Create an ALB with target groups for each service. Health check path: `/actuator/health`.
 6. Use ECS service discovery or AWS Cloud Map for inter-service communication.
+7. Deploy `search-service` and `ingestion-worker` as separate ECS tasks; use Amazon MSK for Kafka and RDS with the `pgvector` extension for `search-db`.
 
 ### Frontend (S3 + CloudFront)
 1. Build: `cd caas-frontend && npm run build`
@@ -125,22 +188,34 @@ Each microservice becomes its own ECS task definition. General pattern:
 3. Create a CloudFront distribution with:
    - Default origin: S3 bucket (OAC/OAI)
    - `/api/*` behavior: origin = ALB (api-gateway), caching disabled
+   - `/api/search/*` behavior: origin = ALB (search-service), caching disabled
 
 ## Local dev
 ```bash
-# Run a single service without Docker (example: cart-service)
+# Run a single Spring service without Docker (example: cart-service)
 cd cart-service
 SPRING_DATASOURCE_PASSWORD=password ./mvnw spring-boot:run
 
 # Frontend hitting the gateway directly
 cd caas-frontend
 VITE_API_BASE=http://localhost:8080/api npm run dev
+
+# Run search-service locally
+cd search-service
+pip install -r requirements.txt
+SEARCH_DB_PASSWORD=password uvicorn main:app --port 8085
+
+# Run ingestion-worker locally
+cd ingestion-worker
+pip install -r requirements.txt
+SEARCH_DB_PASSWORD=password KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python main.py
 ```
 
 ## Security notes
 - Never commit `.env`, API keys, or JWT secrets.
 - `JWT_SECRET` must be the same value across api-gateway, auth-service, user-service, and cart-service.
 - Internal endpoints (`/internal/**` on user-service) are only reachable on the Docker/K8s network — not exposed through nginx or the API gateway.
+- `GET /api/search/**` is a public path (no JWT required) — do not expose sensitive product data through search results.
 - Rotate all secrets before any public deployment.
 
 ## Flyway migrations
@@ -148,3 +223,4 @@ Each service with a database manages its own schema independently:
 - `auth-service/src/main/resources/db/migration/` — `credentials` table
 - `user-service/src/main/resources/db/migration/` — `user_profiles` table
 - `cart-service/src/main/resources/db/migration/` — `cart_items` table
+- `search-service/init.sql` — `search_index` table (mounted into search-db via Docker entrypoint, not Flyway)

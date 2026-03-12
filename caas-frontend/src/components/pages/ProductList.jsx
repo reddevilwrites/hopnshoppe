@@ -11,7 +11,7 @@ const ProductList = ({token}) => {
   const productsPerPage = 6;
 
   useEffect(() => {
-    fetch(`${API_BASE}/products`)
+    fetch(`${API_BASE}/products/unified`)
       .then((res) => res.json())
       .then((data) => {
         setAllProducts(data);
@@ -21,10 +21,10 @@ const ProductList = ({token}) => {
 
   useEffect(() => {
     const filtered = allProducts.filter((p) =>
-      p.title.toLowerCase().includes(search.toLowerCase())
+      p.name.toLowerCase().includes(search.toLowerCase())
     );
     setVisibleProducts(filtered);
-    setCurrentPage(1); // reset to page 1 on new search
+    setCurrentPage(1);
   }, [search, allProducts]);
 
   const paginated = visibleProducts.slice(
@@ -67,28 +67,28 @@ const ProductList = ({token}) => {
               </div>
             ))
           : paginated.map((p) => (
-          <div key={p.sku} className="h-full">
-            <Link to={`/products/${p.sku}`}>
+          <div key={p.id} className="h-full">
+            <Link to={`/products/${p.id}`} state={{ product: p }}>
               <div className="border rounded-lg p-4 shadow hover:shadow-lg transition h-full">
-                <h2 className="font-semibold text-xl mb-2">{p.title}</h2>
+                <h2 className="font-semibold text-xl mb-2">{p.name}</h2>
                 <p
                   className="text-gray-600 text-sm mb-2"
                   dangerouslySetInnerHTML={{ __html: p.description }}
                 />
-                <p className="font-bold text-lg text-blue-700 mb-1">₹{p.price}</p>
-                <p
-                  className={`text-sm ${
-                    p.availability ? "text-green-600" : "text-red-600"
-                  }`}
-                >
-                  {p.availability ? "In Stock" : "Out of Stock"}
-                </p>
-                {p.imagePath && (
+                <p className="font-bold text-lg text-blue-700 mb-1">${p.price}</p>
+                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                  p.source === "MARKETPLACE"
+                    ? "bg-purple-100 text-purple-700"
+                    : "bg-green-100 text-green-700"
+                }`}>
+                  {p.source === "MARKETPLACE" ? "Marketplace" : "AEM Store"}
+                </span>
+                {p.imageUrl && (
                   <img
                   loading="lazy"
-                  src={p.imagePath}
-                  alt={p.title}
-                  className="w-full h-40 object-cover rounded"
+                  src={p.imageUrl}
+                  alt={p.name}
+                  className="w-full h-40 object-cover rounded mt-2"
                   />
                 )}
               </div>

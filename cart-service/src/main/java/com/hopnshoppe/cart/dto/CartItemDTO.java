@@ -10,8 +10,7 @@ import lombok.Data;
 public class CartItemDTO {
     private String sku;
     private int quantity;
-    private String title;
+    private String name;
     private Double price;
-    private String imagePath;
-    private Boolean availability;
+    private String imageUrl;
 }
