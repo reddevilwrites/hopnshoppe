@@ -68,6 +68,20 @@ button:focus-visible {
 } */
 @import "tailwindcss";
 
+/* ── Design tokens ───────────────────────────────────────────────────────── */
+@theme {
+  --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+}
+
+/* ── Global base ─────────────────────────────────────────────────────────── */
+body {
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  background-color: #f8f8f6;
+  color: #1a1a1a;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Skeleton shimmer ────────────────────────────────────────────────────── */
 @keyframes shimmer {
   0%   { background-position: -200% 0; }
   100% { background-position:  200% 0; }
@@ -78,4 +92,22 @@ button:focus-visible {
   background-size: 200% 100%;
   animation: shimmer 1.4s ease-in-out infinite;
   border-radius: 0.375rem;
+}
+
+/* ── Announcement ticker ─────────────────────────────────────────────────── */
+@keyframes ticker-scroll {
+  0%   { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.ticker-track {
+  display: flex;
+  width: max-content;
+  white-space: nowrap;
+  animation: ticker-scroll 24s linear infinite;
+}
+
+/* ── Cyber-lime glow badge ───────────────────────────────────────────────── */
+.glow-lime {
+  box-shadow: 0 0 10px rgba(223, 255, 0, 0.45);
 }
