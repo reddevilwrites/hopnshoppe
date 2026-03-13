@@ -62,7 +62,21 @@ CREATE TABLE IF NOT EXISTS query_cache (
     -- Phase 2 columns ---------------------------------------------------------
     lexical_signature   TEXT,
     query_tokens        JSONB,
-    cache_version       INT         NOT NULL DEFAULT 1
+    cache_version       INT         NOT NULL DEFAULT 1,
+    -- Phase 3 columns ---------------------------------------------------------
+    -- query_embedding: embedding of the normalized_query (all-MiniLM-L6-v2, 384-dim).
+    --   NULL for rows written before Phase 3 or on lexical-near write-backs.
+    --   Populated on every full hybrid search miss and on semantic cache write-backs.
+    query_embedding        VECTOR(384),
+    -- semantic_cache_enabled: set FALSE to exclude a row from semantic candidate scan.
+    semantic_cache_enabled BOOLEAN     NOT NULL DEFAULT TRUE,
+    -- semantic_source_query: the normalized_query of the candidate that was reused
+    --   (populated only on semantic cache write-back rows).
+    semantic_source_query  TEXT,
+    -- semantic_similarity: cosine similarity score of the accepted semantic match.
+    semantic_similarity    REAL,
+    -- semantic_meta: structured debug metadata for the accepted semantic match.
+    semantic_meta          JSONB
 );
 
 -- ── Migration guard: add Phase 2 columns to an existing Phase 1 table ───────
@@ -72,6 +86,13 @@ CREATE TABLE IF NOT EXISTS query_cache (
 ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS lexical_signature TEXT;
 ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS query_tokens       JSONB;
 ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS cache_version      INT NOT NULL DEFAULT 1;
+
+-- ── Migration guard: add Phase 3 columns to an existing Phase 1/2 table ─────
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS query_embedding        VECTOR(384);
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_cache_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_source_query  TEXT;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_similarity    REAL;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_meta          JSONB;
 
 -- Unique constraint: one entry per exact cache identity.
 -- NOT NULL columns ensure uniqueness behaves deterministically (no NULL != NULL edge case).
@@ -98,3 +119,15 @@ CREATE INDEX IF NOT EXISTS query_cache_product_ids_gin_idx
 -- where writes are far less frequent than reads.
 CREATE INDEX IF NOT EXISTS query_cache_normalized_query_trgm_idx
     ON query_cache USING GIN (normalized_query gin_trgm_ops);
+
+-- ── Phase 3 semantic index ────────────────────────────────────────────────────
+-- Phase 3 default: exact cosine scan (no index) — query_cache is small and bounded
+-- by L2 TTL eviction, so exact scan is fast and always correct.
+--
+-- Uncomment the HNSW index below when query_cache regularly exceeds ~10 k active
+-- rows and _semantic_get latency shows up in logs (sem_lookup_ms > ~5 ms).
+-- HNSW gives approximate results; for a cache table that is acceptable.
+--
+-- CREATE INDEX IF NOT EXISTS query_cache_embedding_hnsw_idx
+--     ON query_cache USING hnsw (query_embedding vector_cosine_ops)
+--     WITH (m = 16, ef_construction = 64);
