@@ -1,6 +1,9 @@
 -- Enable pgvector extension (provided by ankane/pgvector image).
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- Enable pg_trgm extension for trigram-based text similarity (Phase 2 lexical-near cache).
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- One row per product.  The denormalized_doc stores all fields a search-result
 -- card needs, so the frontend never needs a follow-up catalog call per result.
 CREATE TABLE IF NOT EXISTS search_index (
@@ -32,6 +35,14 @@ CREATE INDEX IF NOT EXISTS idx_search_fts
 -- Stores ordered product IDs (not full responses) for exact-query cache hits.
 -- On a cache hit, current denormalized_doc rows are bulk-fetched from
 -- search_index in one query so returned cards always reflect live data.
+--
+-- Phase 2 additions (lexical-near cache):
+--   lexical_signature  — normalised query text used for trigram matching
+--                        (currently equal to normalized_query; reserved for
+--                         future stemming/intent-stripping transforms)
+--   query_tokens       — significant tokens after stopword removal, stored as
+--                        a JSON array; used for token-overlap acceptance guards
+--   cache_version      — schema version; 1 = Phase 1 exact, 2 = Phase 2+ rows
 CREATE TABLE IF NOT EXISTS query_cache (
     cache_id            BIGSERIAL PRIMARY KEY,
     normalized_query    TEXT        NOT NULL,
@@ -47,8 +58,20 @@ CREATE TABLE IF NOT EXISTS query_cache (
     expires_at          TIMESTAMPTZ NOT NULL,
     last_hit_at         TIMESTAMPTZ,
     hit_count           INT         NOT NULL DEFAULT 0,
-    status              TEXT        NOT NULL DEFAULT 'ACTIVE'
+    status              TEXT        NOT NULL DEFAULT 'ACTIVE',
+    -- Phase 2 columns ---------------------------------------------------------
+    lexical_signature   TEXT,
+    query_tokens        JSONB,
+    cache_version       INT         NOT NULL DEFAULT 1
 );
+
+-- ── Migration guard: add Phase 2 columns to an existing Phase 1 table ───────
+-- These statements are idempotent — they no-op when the column already exists.
+-- Required when upgrading a running container that was initialised with the
+-- Phase 1 schema (no lexical_signature / query_tokens / cache_version cols).
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS lexical_signature TEXT;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS query_tokens       JSONB;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS cache_version      INT NOT NULL DEFAULT 1;
 
 -- Unique constraint: one entry per exact cache identity.
 -- NOT NULL columns ensure uniqueness behaves deterministically (no NULL != NULL edge case).
@@ -67,3 +90,11 @@ CREATE INDEX IF NOT EXISTS query_cache_last_hit_at_idx
 -- (e.g. invalidate all cache entries containing a specific product_id on price change).
 CREATE INDEX IF NOT EXISTS query_cache_product_ids_gin_idx
     ON query_cache USING GIN (ordered_product_ids);
+
+-- ── Phase 2 trigram index ────────────────────────────────────────────────────
+-- GIN trigram index on normalized_query for fast similarity-candidate retrieval.
+-- Enables the `%` operator (pg_trgm) to use an index rather than a seq-scan.
+-- GIN chosen over GiST: faster reads, acceptable write overhead for a cache table
+-- where writes are far less frequent than reads.
+CREATE INDEX IF NOT EXISTS query_cache_normalized_query_trgm_idx
+    ON query_cache USING GIN (normalized_query gin_trgm_ops);

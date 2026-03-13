@@ -1,10 +1,17 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching
+# Install dependencies first for better layer caching.
+# --mount=type=cache keeps pip's download cache on the host between builds so
+# packages are not re-downloaded from PyPI on every requirements.txt change.
+# The cache is never written into the image layer (same net image size as
+# --no-cache-dir), but cold builds are significantly faster.
+# Requires BuildKit, which docker compose v2 enables by default.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 # Bake the embedding model at build time.
 # - Avoids runtime network dependency (model is baked into the image)
