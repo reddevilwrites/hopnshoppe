@@ -79,6 +79,12 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
+        <!-- Shared DTOs: provides UnifiedProductDTO for catalog enrichment -->
+        <dependency>
+            <groupId>com.hopnshoppe</groupId>
+            <artifactId>common-library</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>

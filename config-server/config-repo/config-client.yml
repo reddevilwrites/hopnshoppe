@@ -9,4 +9,4 @@ logging:
 security:
   api-key: abc123xyzSecureKey
 api:
-  target-url: http://localhost:8081/products
+  target-url: http://localhost:8086/products

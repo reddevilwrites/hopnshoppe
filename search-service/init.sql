@@ -1,0 +1,175 @@
+-- Enable pgvector extension (provided by ankane/pgvector image).
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Enable pg_trgm extension for trigram-based text similarity (Phase 2 lexical-near cache).
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- One row per product.  The denormalized_doc stores all fields a search-result
+-- card needs, so the frontend never needs a follow-up catalog call per result.
+CREATE TABLE IF NOT EXISTS search_index (
+    product_id       TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    brand            TEXT,
+    search_text      TEXT NOT NULL,
+    denormalized_doc JSONB NOT NULL,
+    embedding        VECTOR(384) NOT NULL,
+    price_amount     NUMERIC(12,2),
+    currency         TEXT,
+    in_stock         BOOLEAN,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- HNSW index for approximate nearest-neighbour vector search (cosine distance).
+-- HNSW builds incrementally, requires no minimum row count, and works well
+-- for both small dev datasets and large production tables.
+CREATE INDEX IF NOT EXISTS idx_search_embedding
+    ON search_index USING hnsw (embedding vector_cosine_ops);
+
+-- GIN index over a precomputed tsvector for fast PostgreSQL full-text search.
+-- The expression must match the WHERE clause in the hybrid query exactly so
+-- the planner can use the index.
+CREATE INDEX IF NOT EXISTS idx_search_fts
+    ON search_index USING GIN (to_tsvector('english', search_text));
+
+-- ─── Phase 1 exact-cache ────────────────────────────────────────────────────
+-- Stores ordered product IDs (not full responses) for exact-query cache hits.
+-- On a cache hit, current denormalized_doc rows are bulk-fetched from
+-- search_index in one query so returned cards always reflect live data.
+--
+-- Phase 2 additions (lexical-near cache):
+--   lexical_signature  — normalised query text used for trigram matching
+--                        (currently equal to normalized_query; reserved for
+--                         future stemming/intent-stripping transforms)
+--   query_tokens       — significant tokens after stopword removal, stored as
+--                        a JSON array; used for token-overlap acceptance guards
+--   cache_version      — schema version; 1 = Phase 1 exact, 2 = Phase 2+ rows
+CREATE TABLE IF NOT EXISTS query_cache (
+    cache_id            BIGSERIAL PRIMARY KEY,
+    normalized_query    TEXT        NOT NULL,
+    query_hash          TEXT        NOT NULL,
+    filter_hash         TEXT        NOT NULL,
+    sort_key            TEXT        NOT NULL DEFAULT '',
+    page_number         INT         NOT NULL DEFAULT 1,
+    page_limit          INT         NOT NULL DEFAULT 10,
+    ordered_product_ids TEXT[]      NOT NULL,
+    result_count        INT         NOT NULL,
+    response_meta       JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at          TIMESTAMPTZ NOT NULL,
+    last_hit_at         TIMESTAMPTZ,
+    hit_count           INT         NOT NULL DEFAULT 0,
+    status              TEXT        NOT NULL DEFAULT 'ACTIVE',
+    -- Phase 2 columns ---------------------------------------------------------
+    lexical_signature   TEXT,
+    query_tokens        JSONB,
+    cache_version       INT         NOT NULL DEFAULT 1,
+    -- Phase 3 columns ---------------------------------------------------------
+    -- query_embedding: embedding of the normalized_query (all-MiniLM-L6-v2, 384-dim).
+    --   NULL for rows written before Phase 3 or on lexical-near write-backs.
+    --   Populated on every full hybrid search miss and on semantic cache write-backs.
+    query_embedding        VECTOR(384),
+    -- semantic_cache_enabled: set FALSE to exclude a row from semantic candidate scan.
+    semantic_cache_enabled BOOLEAN     NOT NULL DEFAULT TRUE,
+    -- semantic_source_query: the normalized_query of the candidate that was reused
+    --   (populated only on semantic cache write-back rows).
+    semantic_source_query  TEXT,
+    -- semantic_similarity: cosine similarity score of the accepted semantic match.
+    semantic_similarity    REAL,
+    -- semantic_meta: structured debug metadata for the accepted semantic match.
+    semantic_meta          JSONB
+);
+
+-- ── Migration guard: add Phase 2 columns to an existing Phase 1 table ───────
+-- These statements are idempotent — they no-op when the column already exists.
+-- Required when upgrading a running container that was initialised with the
+-- Phase 1 schema (no lexical_signature / query_tokens / cache_version cols).
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS lexical_signature TEXT;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS query_tokens       JSONB;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS cache_version      INT NOT NULL DEFAULT 1;
+
+-- ── Migration guard: add Phase 3 columns to an existing Phase 1/2 table ─────
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS query_embedding        VECTOR(384);
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_cache_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_source_query  TEXT;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_similarity    REAL;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS semantic_meta          JSONB;
+
+-- Unique constraint: one entry per exact cache identity.
+-- NOT NULL columns ensure uniqueness behaves deterministically (no NULL != NULL edge case).
+CREATE UNIQUE INDEX IF NOT EXISTS query_cache_exact_key_idx
+    ON query_cache (query_hash, filter_hash, sort_key, page_number, page_limit);
+
+-- Index for expiry-based cleanup (DELETE WHERE expires_at <= now()).
+CREATE INDEX IF NOT EXISTS query_cache_expires_at_idx
+    ON query_cache (expires_at);
+
+-- Optional: supports future LRU-style eviction analysis.
+CREATE INDEX IF NOT EXISTS query_cache_last_hit_at_idx
+    ON query_cache (last_hit_at);
+
+-- Optional: GIN index on ordered_product_ids for future product-level invalidation
+-- (e.g. invalidate all cache entries containing a specific product_id on price change).
+CREATE INDEX IF NOT EXISTS query_cache_product_ids_gin_idx
+    ON query_cache USING GIN (ordered_product_ids);
+
+-- ── Phase 2 trigram index ────────────────────────────────────────────────────
+-- GIN trigram index on normalized_query for fast similarity-candidate retrieval.
+-- Enables the `%` operator (pg_trgm) to use an index rather than a seq-scan.
+-- GIN chosen over GiST: faster reads, acceptable write overhead for a cache table
+-- where writes are far less frequent than reads.
+CREATE INDEX IF NOT EXISTS query_cache_normalized_query_trgm_idx
+    ON query_cache USING GIN (normalized_query gin_trgm_ops);
+
+-- ── Phase 3 semantic index ────────────────────────────────────────────────────
+-- Phase 3 default: exact cosine scan (no index) — query_cache is small and bounded
+-- by L2 TTL eviction, so exact scan is fast and always correct.
+--
+-- Uncomment the HNSW index below when query_cache regularly exceeds ~10 k active
+-- rows and _semantic_get latency shows up in logs (sem_lookup_ms > ~5 ms).
+-- HNSW gives approximate results; for a cache table that is acceptable.
+--
+-- CREATE INDEX IF NOT EXISTS query_cache_embedding_hnsw_idx
+--     ON query_cache USING hnsw (query_embedding vector_cosine_ops)
+--     WITH (m = 16, ef_construction = 64);
+
+-- ── Phase 4 freshness columns ─────────────────────────────────────────────────
+-- Two-level TTL model:
+--   soft_expires_at  — entry may still be served but is considered aging (10 min)
+--   hard_expires_at  — entry must not be served (60 min); replaces old single TTL
+--   freshness_status — ACTIVE | SOFT_EXPIRED | HARD_EXPIRED
+--   invalidation_reason — set by event-driven invalidation (e.g. PRICE_UPDATE)
+--   invalidated_at      — when the row was last invalidated
+--   last_refresh_at     — when the entry last received a fresh recomputed result
+--   affected_product_ids — product IDs in this cache entry; used for GIN-based
+--                          invalidation when a product update event arrives
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS soft_expires_at       TIMESTAMPTZ;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS hard_expires_at       TIMESTAMPTZ NOT NULL DEFAULT now() + interval '60 minutes';
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS freshness_status      TEXT        NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS invalidation_reason   TEXT;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS invalidated_at        TIMESTAMPTZ;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS last_refresh_at       TIMESTAMPTZ;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS affected_product_ids  TEXT[];
+
+-- ── Phase 4 indexes ───────────────────────────────────────────────────────────
+
+-- Index for freshness-based filtering (WHERE freshness_status = 'ACTIVE' / != 'HARD_EXPIRED').
+CREATE INDEX IF NOT EXISTS query_cache_freshness_status_idx
+    ON query_cache (freshness_status);
+
+-- Index for hard-expiry cleanup (DELETE WHERE hard_expires_at < now() - '24 hours').
+CREATE INDEX IF NOT EXISTS query_cache_hard_expires_at_idx
+    ON query_cache (hard_expires_at);
+
+-- Optional: supports soft-expiry range queries (WHERE soft_expires_at <= now()).
+CREATE INDEX IF NOT EXISTS query_cache_soft_expires_at_idx
+    ON query_cache (soft_expires_at);
+
+-- GIN index on affected_product_ids for efficient per-product invalidation:
+--   UPDATE query_cache WHERE 'sku-123' = ANY(affected_product_ids)
+-- Uses ordered_product_ids as the source of truth when affected_product_ids is NULL.
+CREATE INDEX IF NOT EXISTS query_cache_affected_product_ids_gin_idx
+    ON query_cache USING GIN (affected_product_ids);
+
+-- Migrate existing rows: populate hard_expires_at from expires_at where NULL.
+-- No-ops on fresh installs (column default handles new rows).
+UPDATE query_cache SET hard_expires_at = expires_at WHERE hard_expires_at IS NULL OR hard_expires_at = now() + interval '60 minutes';

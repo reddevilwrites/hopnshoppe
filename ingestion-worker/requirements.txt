@@ -1,0 +1,5 @@
+# kafka-python-ng: maintained fork of kafka-python with Python 3.12 support
+kafka-python-ng==2.2.3
+sentence-transformers==3.1.1
+psycopg2-binary==2.9.9
+beautifulsoup4==4.12.3

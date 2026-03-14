@@ -2,25 +2,7 @@ version: "3.9"
 
 services:
   # ---------------------------------------------------------------------------
-  # Legacy monolith database — kept for config-client; not used by microservices
-  # ---------------------------------------------------------------------------
-  postgres:
-    image: postgres:16
-    container_name: hopnshoppe-postgres
-    env_file:
-      - .env
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-hopnshoppe}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata-hopnshoppe:/var/lib/postgresql/data
-
-  # ---------------------------------------------------------------------------
   # auth-db — dedicated Postgres instance for auth-service (auth_db)
-  # Runs on host port 5434 to avoid colliding with postgres (5432) and user-db (5433).
   # ---------------------------------------------------------------------------
   auth-db:
     image: postgres:16
@@ -76,8 +58,6 @@ services:
   config-server:
     build: ./config-server
     container_name: hopnshoppe-config-server
-    depends_on:
-      - postgres
     ports:
       - "8888:8888"
     volumes:
@@ -91,7 +71,6 @@ services:
 
   # ---------------------------------------------------------------------------
   # auth-service — credential storage and JWT issuance
-  # NOTE: config-client also uses host port 8081. Do not start both simultaneously.
   # ---------------------------------------------------------------------------
   auth-service:
     build: ./auth-service
@@ -193,6 +172,39 @@ services:
       - pgdata-cart:/var/lib/postgresql/data
 
   # ---------------------------------------------------------------------------
+  # Kafka — single-node KRaft broker (no Zookeeper).
+  # Internal clients use kafka:9092; external tooling uses localhost:9092.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: hopnshoppe-kafka
+    environment:
+      # KRaft mode — no Zookeeper required
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      # Auto-create topics so product-updates and product-updates.DLQ are created on first use
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+  # ---------------------------------------------------------------------------
   # catalog-service — stateless GraphQL proxy to AEM CMS (no database)
   # AEM dispatcher is expected on host port 8090 (host.docker.internal:8090).
   # ---------------------------------------------------------------------------
@@ -204,15 +216,92 @@ services:
         condition: service_healthy
       config-server:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     env_file:
       - .env
     environment:
       SPRING_CLOUD_CONFIG_URI: http://config-server:8888
       EUREKA_URI: http://discovery-server:8761/eureka/
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "8083:8083"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8083/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # search-db — PostgreSQL + pgvector for the semantic search index.
+  # Runs on host port 5436 to avoid colliding with other Postgres instances.
+  # The init.sql script creates the vector extension, table, and indexes
+  # on first boot (when the data volume is empty).
+  # ---------------------------------------------------------------------------
+  search-db:
+    image: ankane/pgvector
+    container_name: hopnshoppe-search-db
+    environment:
+      POSTGRES_DB: search_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+    ports:
+      - "5436:5432"
+    volumes:
+      - pgdata-search:/var/lib/postgresql/data
+      - ./search-service/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d search_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # ingestion-worker — Python 3.12 semantic search pipeline.
+  # Consumes product-updates from Kafka, embeds with sentence-transformers,
+  # and upserts into search-db (pgvector).
+  # Supports FULL_UPDATE (rebuild embedding) and PRICE_UPDATE (volatile fields only).
+  # Failed writes are routed to product-updates.DLQ.
+  # ---------------------------------------------------------------------------
+  ingestion-worker:
+    build: ./ingestion-worker
+    container_name: hopnshoppe-ingestion-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+      search-db:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SEARCH_DB_HOST: search-db
+      SEARCH_DB_NAME: search_db
+      SEARCH_DB_USER: ${POSTGRES_USER:-postgres}
+      SEARCH_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # search-service — Python FastAPI hybrid semantic search endpoint.
+  # GET /search?q=...&limit=...  →  hybrid ranking (70% vector + 30% FTS)
+  # Returns denormalized product docs directly; no catalog-service call per result.
+  # ---------------------------------------------------------------------------
+  search-service:
+    build: ./search-service
+    container_name: hopnshoppe-search-service
+    depends_on:
+      search-db:
+        condition: service_healthy
+    environment:
+      SEARCH_DB_HOST: search-db
+      SEARCH_DB_NAME: search_db
+      SEARCH_DB_USER: ${POSTGRES_USER:-postgres}
+      SEARCH_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+    ports:
+      - "8085:8085"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8085/health')\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -251,28 +340,6 @@ services:
       start_period: 40s
 
   # ---------------------------------------------------------------------------
-  # Legacy monolith — kept for reference during migration.
-  # NOTE: conflicts with auth-service on host port 8081. Do not start simultaneously.
-  # ---------------------------------------------------------------------------
-  config-client:
-    build: ./config-client
-    container_name: hopnshoppe-config-client
-    depends_on:
-      config-server:
-        condition: service_healthy
-      postgres:
-        condition: service_started
-    env_file:
-      - .env
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-hopnshoppe}
-      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-postgres}
-      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
-      SPRING_CLOUD_CONFIG_URI: http://config-server:8888
-    ports:
-      - "8081:8081"
-
-  # ---------------------------------------------------------------------------
   # Frontend — React SPA served by nginx.
   # nginx proxies /api/* and /auth/* to api-gateway:8080.
   # ---------------------------------------------------------------------------
@@ -286,7 +353,8 @@ services:
       - "5173:80"
 
 volumes:
-  pgdata-hopnshoppe:
   pgdata-auth:
   pgdata-user:
   pgdata-cart:
+  pgdata-search:
+  kafka-data:

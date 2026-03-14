@@ -99,125 +99,184 @@ const Cart = ({ token, onCartChange, onAuthFail }) => {
     navigate("/checkout")
   }
 
-  return (
-    <div className="max-w-6xl mx-auto px-6 py-10">
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <p className="text-sm text-gray-500">Your bag</p>
-          <h1 className="text-3xl font-bold">Shopping Cart</h1>
-        </div>
-        <Link
-          to="/products"
-          className="text-blue-600 hover:underline font-medium"
-        >
-          Continue shopping
-        </Link>
-      </div>
+  const FREE_SHIPPING_THRESHOLD = 100;
+  const shippingProgress = Math.min((total / FREE_SHIPPING_THRESHOLD) * 100, 100);
+  const remainingForFreeShipping = Math.max(FREE_SHIPPING_THRESHOLD - total, 0);
 
-      {loading ? (
-        <div className="text-gray-600">Loading cart...</div>
-      ) : error ? (
-        <div className="text-red-600">{error}</div>
-      ) : items.length === 0 ? (
-        <div className="bg-white border border-dashed border-gray-300 rounded-xl p-10 text-center">
-          <p className="text-lg font-semibold text-gray-700">
-            Your cart is empty.
-          </p>
-          <p className="text-gray-500 mt-2">
-            Discover products and add them to your cart.
-          </p>
+  return (
+    <div className="min-h-screen bg-[#f8f8f6]">
+      <div className="max-w-6xl mx-auto px-6 py-10">
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <p className="text-xs uppercase tracking-widest text-gray-400 font-semibold mb-1">Your Bag</p>
+            <h1 className="text-4xl font-bold" style={{ fontFamily: "'Playfair Display', serif" }}>Cart</h1>
+          </div>
           <Link
             to="/products"
-            className="inline-block mt-4 px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
+            className="text-sm text-gray-500 hover:text-black transition font-medium"
           >
-            Browse products
+            ← Continue shopping
           </Link>
         </div>
-      ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2 space-y-4">
-            {items.map((item) => (
-              <div
-                key={item.sku}
-                className="flex gap-4 bg-white border border-gray-200 rounded-xl shadow-sm p-4"
-              >
-                <div className="w-24 h-24 bg-gray-100 rounded-lg overflow-hidden">
-                  {item.imagePath ? (
-                    <img
-                      src={item.imagePath}
-                      alt={item.title}
-                      className="w-full h-full object-cover"
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-gray-400 text-sm">
-                      No image
-                    </div>
-                  )}
-                </div>
-                <div className="flex-1 flex flex-col">
-                  <div className="flex justify-between">
-                    <div>
-                      <h3 className="text-lg font-semibold">{item.title}</h3>
-                      <p className="text-sm text-gray-500">SKU: {item.sku}</p>
-                      <p
-                        className={`text-xs mt-1 ${
-                          item.availability ? "text-green-600" : "text-red-600"
-                        }`}
-                      >
-                        {item.availability ? "In stock" : "Out of stock"}
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => removeItem(item.sku)}
-                      className="text-sm text-red-500 hover:text-red-800"
-                    >
-                      Remove
-                    </button>
-                  </div>
 
-                  <div className="mt-auto flex items-center justify-between">
-                    <div className="flex items-center space-x-3">
-                      <button
-                        className="w-8 h-8 rounded-full border border-gray-300 text-lg leading-none"
-                        onClick={() => updateQuantity(item.sku, "decrement")}
-                      >
-                        -
-                      </button>
-                      <span className="w-10 text-center font-semibold">
-                        {item.quantity}
-                      </span>
-                      <button
-                        className="w-8 h-8 rounded-full border border-gray-300 text-lg leading-none"
-                        onClick={() => updateQuantity(item.sku, "increment")}
-                      >
-                        +
-                      </button>
+        {loading ? (
+          <div className="text-gray-400 text-sm animate-pulse">Loading cart…</div>
+        ) : error ? (
+          <div className="text-red-500 text-sm">{error}</div>
+        ) : items.length === 0 ? (
+          <div className="bg-white rounded-3xl p-12 text-center shadow-sm">
+            <p className="text-2xl font-bold mb-2" style={{ fontFamily: "'Playfair Display', serif" }}>
+              Your cart is empty.
+            </p>
+            <p className="text-gray-400 text-sm mt-1 mb-6">
+              Discover products and add them to your cart.
+            </p>
+            <Link
+              to="/products"
+              className="inline-block px-6 py-3 rounded-2xl bg-black text-[#dfff00] font-bold hover:bg-gray-900 transition"
+            >
+              Browse products
+            </Link>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            {/* Cart items */}
+            <div className="lg:col-span-2 space-y-4">
+              {items.map((item) => {
+                // Normalise field names: CartItemDTO uses title/imagePath (AEM);
+                // future unified enrichment may use name/imageUrl (MARKETPLACE)
+                const displayName = item.title || item.name || item.sku;
+                const displayImage = item.imagePath || item.imageUrl;
+                const hasAvailability = item.availability !== null && item.availability !== undefined;
+
+                return (
+                  <div
+                    key={item.sku}
+                    className="flex gap-4 bg-white rounded-3xl shadow-sm p-4"
+                  >
+                    <div className="w-24 h-24 bg-gray-100 rounded-2xl overflow-hidden shrink-0">
+                      {displayImage ? (
+                        <img
+                          src={displayImage}
+                          alt={displayName}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-gray-300 text-xs">
+                          No image
+                        </div>
+                      )}
                     </div>
-                    <div className="text-lg font-semibold text-blue-700">
-                      ₹{(item.price || 0).toFixed(2)}
+                    <div className="flex-1 flex flex-col">
+                      <div className="flex justify-between">
+                        <div>
+                          <h3 className="text-base font-semibold leading-tight">{displayName}</h3>
+                          <p className="text-xs text-gray-400 mt-0.5">SKU: {item.sku}</p>
+                          {hasAvailability && (
+                            <p className={`text-xs mt-1 ${item.availability ? "text-green-600" : "text-red-500"}`}>
+                              {item.availability ? "In stock" : "Out of stock"}
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => removeItem(item.sku)}
+                          className="text-xs text-gray-400 hover:text-red-500 transition"
+                        >
+                          Remove
+                        </button>
+                      </div>
+
+                      <div className="mt-auto flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <button
+                            className="w-8 h-8 rounded-full bg-gray-100 hover:bg-gray-200 text-base font-bold transition flex items-center justify-center"
+                            onClick={() => updateQuantity(item.sku, "decrement")}
+                          >
+                            −
+                          </button>
+                          <span className="w-8 text-center font-semibold text-sm">
+                            {item.quantity}
+                          </span>
+                          <button
+                            className="w-8 h-8 rounded-full bg-gray-100 hover:bg-gray-200 text-base font-bold transition flex items-center justify-center"
+                            onClick={() => updateQuantity(item.sku, "increment")}
+                          >
+                            +
+                          </button>
+                        </div>
+                        <div className="text-base font-bold">
+                          ${(item.price || 0).toFixed(2)}
+                        </div>
+                      </div>
                     </div>
                   </div>
+                );
+              })}
+            </div>
+
+            {/* Summary — dark drawer panel */}
+            <aside className="bg-gray-950 text-white rounded-3xl p-6 h-fit space-y-5">
+              {/* Free Shipping progress */}
+              <div>
+                <div className="flex justify-between text-xs mb-2">
+                  <span className="text-white/60">
+                    {shippingProgress >= 100
+                      ? "🎉 You've unlocked Free Shipping!"
+                      : `$${remainingForFreeShipping.toFixed(2)} away from FREE Shipping`}
+                  </span>
+                </div>
+                <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-[#dfff00] rounded-full transition-all duration-500"
+                    style={{ width: `${shippingProgress}%` }}
+                  />
                 </div>
               </div>
-            ))}
-          </div>
 
-          <aside className="bg-white border border-gray-200 rounded-xl shadow-sm p-6 h-fit">
-            <h2 className="text-xl font-semibold mb-4">Summary</h2>
-            <div className="flex justify-between text-gray-700 mb-2">
-              <span>Items</span>
-              <span>{items.length}</span>
-            </div>
-            <div className="flex justify-between text-gray-700 mb-4">
-              <span>Subtotal</span>
-              <span className="font-semibold">₹{total.toFixed(2)}</span>
-            </div>
-            <button onClick={handleCheckout} className="w-full py-3 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 transition">
-              Proceed to checkout
-            </button>
-          </aside>
-        </div>
-      )}
+              {/* Totals */}
+              <div className="space-y-2 border-t border-white/10 pt-4">
+                <div className="flex justify-between text-white/60 text-sm">
+                  <span>Items</span>
+                  <span>{items.length}</span>
+                </div>
+                <div className="flex justify-between text-white text-base font-semibold">
+                  <span>Subtotal</span>
+                  <span>${total.toFixed(2)}</span>
+                </div>
+              </div>
+
+              {/* Express checkout */}
+              <div className="space-y-2.5">
+                <p className="text-xs text-center text-white/40 uppercase tracking-wider">Express Checkout</p>
+                <button className="w-full py-3.5 rounded-2xl bg-white text-black font-bold text-sm flex items-center justify-center gap-2 hover:bg-gray-100 transition">
+                  <span className="text-base"></span> Apple Pay
+                </button>
+                <button className="w-full py-3.5 rounded-2xl bg-[#4285F4] text-white font-bold text-sm flex items-center justify-center gap-2 hover:opacity-90 transition">
+                  <span className="font-black">G</span> Google Pay
+                </button>
+                <button className="w-full py-3.5 rounded-2xl bg-[#5A31F4] text-white font-bold text-sm flex items-center justify-center gap-2 hover:opacity-90 transition">
+                  Shop Pay
+                </button>
+              </div>
+
+              {/* Standard checkout */}
+              <div className="space-y-2">
+                <div className="flex items-center gap-3">
+                  <div className="flex-1 h-px bg-white/10" />
+                  <span className="text-white/30 text-xs">or</span>
+                  <div className="flex-1 h-px bg-white/10" />
+                </div>
+                <button
+                  onClick={handleCheckout}
+                  className="w-full py-3 rounded-2xl border border-white/20 text-white/70 text-sm font-medium hover:border-white/40 hover:text-white transition"
+                >
+                  Standard Checkout
+                </button>
+              </div>
+            </aside>
+          </div>
+        )}
+      </div>
     </div>
   );
 };

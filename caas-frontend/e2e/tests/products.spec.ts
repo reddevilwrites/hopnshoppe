@@ -73,7 +73,7 @@ test.describe('Product catalog (mocked)', () => {
     await detail.goto('SKU-001');
 
     await detail.expectTitle('Ceramic Mug');
-    await expect(page.locator('text=₹12.99')).toBeVisible();
+    await expect(page.locator('text=$12.99')).toBeVisible();
     await expect(page.locator('text=In Stock')).toBeVisible();
   });
 });

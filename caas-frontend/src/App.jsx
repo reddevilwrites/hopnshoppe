@@ -2,33 +2,34 @@ import { lazy, Suspense, useEffect, useState } from 'react'
 import { Buffer } from 'buffer'
 import './App.css'
 import Header from './components/Header'
-import { Navigate, Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import Home from './components/pages/Home'
 import Signup from './components/pages/Signup'
 import Account from './components/pages/Account'
 import Checkout from './components/pages/Checkout'
+import { API_BASE } from './api'
+
+const ProductList = lazy(() => import('./components/pages/ProductList'));
+const ProductDetail = lazy(() => import('./components/pages/ProductDetail'));
+const Login = lazy(() => import('./components/pages/Login'));
+const Cart = lazy(() => import('./components/pages/Cart'));
 
 function App() {
   const [count, setCount] = useState(0)
   const [token, setToken] = useState(sessionStorage.getItem('token'));
   const [userName, setUserName] = useState(sessionStorage.getItem('username') || "");
 
-  const ProductList = lazy(() => import('./components/pages/ProductList'));
-
-  const ProductDetail = lazy(() => import('./components/pages/ProductDetail'));
-
-  const Login = lazy(() => import('./components/pages/Login'));
-  const Cart = lazy(() => import('./components/pages/Cart'));
-
   const [cartCount, setCartCount] = useState(0);
+  const { pathname } = useLocation();
 
   const refreshCartCount = async (activeToken = token) => {
+    if (pathname === '/cart') return;
     if (!activeToken) {
       setCartCount(0);
       return;
     }
     try {
-      const res = await fetch("/api/cart", {
+      const res = await fetch(`${API_BASE}/cart`, {
         headers: { "Authorization": `Bearer ${activeToken}` }
       });
       if (res.ok) {

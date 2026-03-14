@@ -2,13 +2,14 @@ package com.hopnshoppe.cart.service;
 
 import com.hopnshoppe.cart.client.CatalogClient;
 import com.hopnshoppe.cart.dto.CartItemDTO;
-import com.hopnshoppe.cart.dto.ProductDTO;
 import com.hopnshoppe.cart.model.CartItem;
 import com.hopnshoppe.cart.repository.CartItemRepository;
+import com.hopnshoppe.common.dto.UnifiedProductDTO;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
@@ -34,13 +35,29 @@ public class CartService {
                     return c;
                 });
         item.setQuantity(item.getQuantity() + qtyToAdd);
-        return toDto(cartItemRepository.save(item));
+        return enriched(cartItemRepository.save(item));
     }
 
     public List<CartItemDTO> getCart(String userEmail) {
-        return cartItemRepository.findByUserEmail(userEmail).stream()
-                .map(this::toDto)
-                .collect(Collectors.toList());
+        List<CartItem> items = cartItemRepository.findByUserEmail(userEmail);
+        if (items.isEmpty()) return List.of();
+
+        List<String> skus = items.stream().map(CartItem::getSku).collect(Collectors.toList());
+        Map<String, UnifiedProductDTO> productMap = catalogClient.getUnifiedProductsByIds(skus).stream()
+                .collect(Collectors.toMap(UnifiedProductDTO::getId, p -> p, (a, b) -> a));
+
+        return items.stream().map(item -> {
+            CartItemDTO dto = new CartItemDTO();
+            dto.setSku(item.getSku());
+            dto.setQuantity(item.getQuantity());
+            UnifiedProductDTO product = productMap.get(item.getSku());
+            if (product != null) {
+                dto.setName(product.getName());
+                dto.setPrice(product.getPrice());
+                dto.setImageUrl(product.getImageUrl());
+            }
+            return dto;
+        }).collect(Collectors.toList());
     }
 
     @Transactional
@@ -48,7 +65,7 @@ public class CartService {
         CartItem item = cartItemRepository.findByUserEmailAndSku(userEmail, sku)
                 .orElseThrow(() -> new IllegalArgumentException("Item not found in cart"));
         item.setQuantity(item.getQuantity() + 1);
-        return toDto(cartItemRepository.save(item));
+        return enriched(cartItemRepository.save(item));
     }
 
     @Transactional
@@ -60,7 +77,7 @@ public class CartService {
             return null;
         }
         item.setQuantity(item.getQuantity() - 1);
-        return toDto(cartItemRepository.save(item));
+        return enriched(cartItemRepository.save(item));
     }
 
     @Transactional
@@ -69,17 +86,17 @@ public class CartService {
                 .ifPresent(cartItemRepository::delete);
     }
 
-    private CartItemDTO toDto(CartItem item) {
+    private CartItemDTO enriched(CartItem item) {
         CartItemDTO dto = new CartItemDTO();
         dto.setSku(item.getSku());
         dto.setQuantity(item.getQuantity());
-        ProductDTO product = catalogClient.getProductBySku(item.getSku());
+        UnifiedProductDTO product = catalogClient.getUnifiedProductById(item.getSku());
         if (product != null) {
-            dto.setTitle(product.title);
-            dto.setPrice(product.price);
-            dto.setAvailability(product.availability);
-            dto.setImagePath(product.imagePath);
+            dto.setName(product.getName());
+            dto.setPrice(product.getPrice());
+            dto.setImageUrl(product.getImageUrl());
         }
         return dto;
     }
+
 }

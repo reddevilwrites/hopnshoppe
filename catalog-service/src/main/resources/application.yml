@@ -9,6 +9,14 @@ spring:
     timeout-per-shutdown-phase: 30s
   config:
     import: optional:configserver:${SPRING_CLOUD_CONFIG_URI:http://config-server:8888}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Suppress __TypeId__ headers so the Python consumer receives plain JSON
+      properties:
+        spring.json.add.type.headers: false
 
 eureka:
   client:
@@ -19,16 +27,52 @@ eureka:
     lease-renewal-interval-in-seconds: 10
     lease-expiration-duration-in-seconds: 30
 
+# ---------------------------------------------------------------------------
+# DummyJSON external marketplace API.
+# Override via config-server or DUMMYJSON_BASE_URL env var for staging/prod.
+# ---------------------------------------------------------------------------
+dummyjson:
+  base-url: https://dummyjson.com
+
+# ---------------------------------------------------------------------------
+# Resilience4j circuit breakers.
+# dummyjson  — opens when 60% of the last 5 calls fail; stays open 10 s.
+# legacysoap — opens when 50% of the last 5 calls fail; stays open 15 s.
+# ---------------------------------------------------------------------------
+resilience4j:
+  circuitbreaker:
+    instances:
+      dummyjson:
+        register-health-indicator: true
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 5
+        minimum-number-of-calls: 3
+        permitted-number-of-calls-in-half-open-state: 2
+        failure-rate-threshold: 60
+        wait-duration-in-open-state: 10s
+        automatic-transition-from-open-to-half-open-enabled: true
+      legacysoap:
+        register-health-indicator: true
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 5
+        minimum-number-of-calls: 3
+        permitted-number-of-calls-in-half-open-state: 2
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 15s
+        automatic-transition-from-open-to-half-open-enabled: true
+
 management:
   endpoints:
     web:
       exposure:
-        include: health, info
+        include: health, info, circuitbreakers
   endpoint:
     health:
       show-details: always
       probes:
         enabled: true
+    circuitbreakers:
+      enabled: true
 
 logging:
   level:
