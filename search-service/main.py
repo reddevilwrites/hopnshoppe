@@ -72,6 +72,7 @@ import re
 import select
 import threading
 import time
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -109,6 +110,14 @@ L1_TTL_SECONDS      = 120     # 2 min — hot in-process cache (must be < soft T
 L1_MAX_ENTRIES      = 500     # evict oldest 10% when ceiling is reached
 L2_SOFT_TTL_SECONDS = 600     # 10 min — ACTIVE window; SOFT_EXPIRED after this
 L2_HARD_TTL_SECONDS = 3600    # 60 min — hard barrier; HARD_EXPIRED rows never served
+
+# ── Adaptive TTL constants (Phase 5) ────────────────────────────────────────
+# soft_ttl = min(L2_SOFT_TTL_SECONDS * (1 + log10(max(hit_count, 1))),
+#                L2_HARD_TTL_SECONDS)
+# Floor  = L2_SOFT_TTL_SECONDS — cold entries always get the base window.
+# Ceiling = L2_HARD_TTL_SECONDS — soft never exceeds hard.
+ADAPTIVE_TTL_ENABLED = True     # set False to revert to fixed TTL without redeploy
+ADAPTIVE_TTL_CEILING = L2_HARD_TTL_SECONDS   # 3600s — must equal hard TTL
 
 # ── Lexical-near constants (Phase 2) ────────────────────────────────────────
 LEXICAL_NEAR_SIMILARITY_THRESHOLD = 0.76
@@ -253,6 +262,30 @@ def _tokenize(text: str) -> list:
         t for t in _TOKEN_SPLIT.split(text.lower())
         if t and len(t) > 1 and t not in _STOPWORDS
     ]
+
+
+def _adaptive_soft_ttl(hit_count: int) -> int:
+    """
+    Python-side adaptive soft TTL. Used by _refresh_cache_entry()
+    so background refreshes can set a warm initial soft window
+    when hit_count is available from the DB before the upsert.
+
+    Formula mirrors the PostgreSQL LOG() expression in _l2_get():
+        L2_SOFT_TTL_SECONDS * (1 + log10(max(hit_count, 1)))
+    Clamped to [L2_SOFT_TTL_SECONDS, ADAPTIVE_TTL_CEILING].
+
+    Returns L2_SOFT_TTL_SECONDS unchanged if ADAPTIVE_TTL_ENABLED=False.
+
+    Example outputs:
+        hit_count=0    →  600s  (base; log10(1)=0 → multiplier=1.0)
+        hit_count=10   → 1200s  (log10(10)=1.0   → multiplier=2.0)
+        hit_count=100  → 1800s  (log10(100)=2.0  → multiplier=3.0)
+        hit_count=1000 → 2400s  (log10(1000)=3.0 → multiplier=4.0)
+    """
+    if not ADAPTIVE_TTL_ENABLED:
+        return L2_SOFT_TTL_SECONDS
+    multiplier = 1.0 + math.log10(max(hit_count, 1))
+    return int(min(L2_SOFT_TTL_SECONDS * multiplier, ADAPTIVE_TTL_CEILING))
 
 
 def _has_price_intent_conflict(tokens_a: list, tokens_b: list) -> bool:
@@ -435,8 +468,28 @@ def _l2_get(
                 cur.execute(
                     """
                     UPDATE query_cache
-                    SET    hit_count   = hit_count + 1,
-                           last_hit_at = now()
+                    SET    hit_count       = hit_count + 1,
+                           last_hit_at    = now(),
+                           soft_expires_at = CASE
+                               WHEN %s THEN
+                                   -- Adaptive: extend window using log10(new hit_count).
+                                   -- GREATEST: never shorten an expiry already further out.
+                                   -- LEAST:    never let soft exceed hard.
+                                   LEAST(
+                                       hard_expires_at,
+                                       GREATEST(
+                                           soft_expires_at,
+                                           now() + make_interval(secs =>
+                                               LEAST(
+                                                   %s::float * (1.0 + LOG(GREATEST(hit_count + 1, 1))),
+                                                   %s::float
+                                               )
+                                           )
+                                       )
+                                   )
+                               ELSE
+                                   soft_expires_at
+                           END
                     WHERE  query_hash        = %s
                       AND  filter_hash       = %s
                       AND  sort_key          = %s
@@ -445,17 +498,31 @@ def _l2_get(
                       AND  hard_expires_at   > now()
                       AND  freshness_status != 'HARD_EXPIRED'
                     RETURNING ordered_product_ids, result_count, response_meta,
-                              freshness_status, soft_expires_at, hard_expires_at
+                              freshness_status, soft_expires_at, hard_expires_at,
+                              hit_count
                     """,
-                    (query_hash, filter_hash, sort_key, page_number, page_limit),
+                    (
+                        ADAPTIVE_TTL_ENABLED,           # %s 1 — CASE WHEN condition
+                        float(L2_SOFT_TTL_SECONDS),     # %s 2 — base seconds for LOG
+                        float(ADAPTIVE_TTL_CEILING),    # %s 3 — LEAST cap (= hard TTL)
+                        query_hash,                     # %s 4
+                        filter_hash,                    # %s 5
+                        sort_key,                       # %s 6
+                        page_number,                    # %s 7
+                        page_limit,                     # %s 8
+                    ),
                 )
                 row = cur.fetchone()
         if row is None:
             return None
-        eff = _effective_freshness(row["freshness_status"], row["soft_expires_at"])
+        eff     = _effective_freshness(row["freshness_status"], row["soft_expires_at"])
         hard_dt = row["hard_expires_at"]
         if hard_dt and hard_dt.tzinfo is None:
             hard_dt = hard_dt.replace(tzinfo=timezone.utc)
+        logger.debug(
+            "L2 hit — hash=%.8s… hit_count=%d soft_expires_at=%s freshness=%s",
+            query_hash, row["hit_count"], row["soft_expires_at"], eff,
+        )
         return _L2Result(
             ordered_product_ids=list(row["ordered_product_ids"]),
             result_count=row["result_count"],
@@ -492,6 +559,11 @@ def _l2_put(
     """
     now_utc       = datetime.now(timezone.utc)
     soft_expires  = now_utc + timedelta(seconds=L2_SOFT_TTL_SECONDS)
+    # NOTE: _l2_put always writes the base soft TTL regardless of
+    # ADAPTIVE_TTL_ENABLED. The adaptive extension happens live in
+    # _l2_get() on each subsequent hit. Do not call _adaptive_soft_ttl()
+    # here — hit_count is unknown at insert time and resets to 0 on
+    # conflict, so the base window is always the correct starting point.
     hard_expires  = now_utc + timedelta(seconds=L2_HARD_TTL_SECONDS)
     # Keep expires_at = hard_expires for backward compatibility with old cleanup code.
     expires_at    = hard_expires
@@ -1542,7 +1614,7 @@ def health():
 
 @app.get("/cache/stats")
 def cache_stats():
-    """Diagnostics: cache hit/miss counters, L1 occupancy, Phase 2/3/4 metrics."""
+    """Diagnostics: cache hit/miss counters, L1 occupancy, Phase 2/3/4/5 metrics."""
     now       = time.monotonic()
     now_wall  = datetime.now(timezone.utc)
     l1_active = sum(
@@ -1559,6 +1631,45 @@ def cache_stats():
         + _metrics["semantic_hits"]
     )
     total_requests = total_cache_hits + _metrics["misses"]
+
+    # ── Phase 5: adaptive TTL temperature histogram ──────────────────────────
+    # Non-fatal — a DB error here must never crash the stats endpoint.
+    ttl_histogram = {
+        "cold_entries":             0,    # hit_count = 0 (never hit since write)
+        "warm_entries":             0,    # hit_count 1–9
+        "hot_entries":              0,    # hit_count 10–99
+        "viral_entries":            0,    # hit_count >= 100
+        "avg_soft_ttl_remaining_s": None, # None when table is empty
+        "max_hit_count":            0,
+    }
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE hit_count = 0)               AS cold_entries,
+                        COUNT(*) FILTER (WHERE hit_count BETWEEN 1 AND 9)   AS warm_entries,
+                        COUNT(*) FILTER (WHERE hit_count BETWEEN 10 AND 99) AS hot_entries,
+                        COUNT(*) FILTER (WHERE hit_count >= 100)            AS viral_entries,
+                        ROUND(AVG(
+                            EXTRACT(EPOCH FROM (soft_expires_at - now()))
+                        ))::int                                             AS avg_soft_ttl_remaining_s,
+                        MAX(hit_count)                                      AS max_hit_count
+                    FROM query_cache
+                    WHERE hard_expires_at  > now()
+                      AND freshness_status != 'HARD_EXPIRED'
+                    """
+                )
+                row = cur.fetchone()
+        if row:
+            ttl_histogram = {
+                k: (int(v) if v is not None else None)
+                for k, v in dict(row).items()
+            }
+    except psycopg2.Error as exc:
+        logger.debug("TTL histogram fetch error (non-fatal): %s", exc)
+
     return {
         # L1
         "l1_size_active":              l1_active,
@@ -1567,6 +1678,9 @@ def cache_stats():
         # L2 TTLs (Phase 4)
         "l2_soft_ttl_seconds":         L2_SOFT_TTL_SECONDS,
         "l2_hard_ttl_seconds":         L2_HARD_TTL_SECONDS,
+        # Adaptive TTL config (Phase 5)
+        "adaptive_ttl_enabled":        ADAPTIVE_TTL_ENABLED,
+        "adaptive_ttl_ceiling_s":      ADAPTIVE_TTL_CEILING,
         # Lexical-near config (Phase 2)
         "lexical_near_threshold":      LEXICAL_NEAR_SIMILARITY_THRESHOLD,
         "lexical_near_max_cands":      LEXICAL_NEAR_MAX_CANDIDATES,
@@ -1581,4 +1695,6 @@ def cache_stats():
         "total_requests":              total_requests,
         "embedding_skips":             _metrics["lexical_near_hits"],
         "cache_hit_rate":              round(total_cache_hits / max(total_requests, 1), 4),
+        # Adaptive TTL histogram (Phase 5)
+        **ttl_histogram,
     }

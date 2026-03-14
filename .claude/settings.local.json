@@ -11,7 +11,8 @@
       "Bash(python -c \"import sys,json; data=json.load\\(sys.stdin\\); sources={}; [sources.update\\({p[''source'']: sources.get\\(p[''source''],0\\)+1}\\) for p in data]; print\\(sources\\)\")",
       "Read(//cygdrive/c/Users/raymo/Documents/Upskill/Personal-Project/**)",
       "Bash(python search-service/test_pool_concurrency.py)",
-      "Bash(python \"c:/Users/raymo/Documents/Upskill/Personal-Project/hopnshoppe/search-service/test_pool_concurrency.py\")"
+      "Bash(python \"c:/Users/raymo/Documents/Upskill/Personal-Project/hopnshoppe/search-service/test_pool_concurrency.py\")",
+      "Bash(python -c \":*)"
     ]
   }
 }
