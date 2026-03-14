@@ -131,3 +131,45 @@ CREATE INDEX IF NOT EXISTS query_cache_normalized_query_trgm_idx
 -- CREATE INDEX IF NOT EXISTS query_cache_embedding_hnsw_idx
 --     ON query_cache USING hnsw (query_embedding vector_cosine_ops)
 --     WITH (m = 16, ef_construction = 64);
+
+-- ── Phase 4 freshness columns ─────────────────────────────────────────────────
+-- Two-level TTL model:
+--   soft_expires_at  — entry may still be served but is considered aging (10 min)
+--   hard_expires_at  — entry must not be served (60 min); replaces old single TTL
+--   freshness_status — ACTIVE | SOFT_EXPIRED | HARD_EXPIRED
+--   invalidation_reason — set by event-driven invalidation (e.g. PRICE_UPDATE)
+--   invalidated_at      — when the row was last invalidated
+--   last_refresh_at     — when the entry last received a fresh recomputed result
+--   affected_product_ids — product IDs in this cache entry; used for GIN-based
+--                          invalidation when a product update event arrives
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS soft_expires_at       TIMESTAMPTZ;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS hard_expires_at       TIMESTAMPTZ NOT NULL DEFAULT now() + interval '60 minutes';
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS freshness_status      TEXT        NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS invalidation_reason   TEXT;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS invalidated_at        TIMESTAMPTZ;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS last_refresh_at       TIMESTAMPTZ;
+ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS affected_product_ids  TEXT[];
+
+-- ── Phase 4 indexes ───────────────────────────────────────────────────────────
+
+-- Index for freshness-based filtering (WHERE freshness_status = 'ACTIVE' / != 'HARD_EXPIRED').
+CREATE INDEX IF NOT EXISTS query_cache_freshness_status_idx
+    ON query_cache (freshness_status);
+
+-- Index for hard-expiry cleanup (DELETE WHERE hard_expires_at < now() - '24 hours').
+CREATE INDEX IF NOT EXISTS query_cache_hard_expires_at_idx
+    ON query_cache (hard_expires_at);
+
+-- Optional: supports soft-expiry range queries (WHERE soft_expires_at <= now()).
+CREATE INDEX IF NOT EXISTS query_cache_soft_expires_at_idx
+    ON query_cache (soft_expires_at);
+
+-- GIN index on affected_product_ids for efficient per-product invalidation:
+--   UPDATE query_cache WHERE 'sku-123' = ANY(affected_product_ids)
+-- Uses ordered_product_ids as the source of truth when affected_product_ids is NULL.
+CREATE INDEX IF NOT EXISTS query_cache_affected_product_ids_gin_idx
+    ON query_cache USING GIN (affected_product_ids);
+
+-- Migrate existing rows: populate hard_expires_at from expires_at where NULL.
+-- No-ops on fresh installs (column default handles new rows).
+UPDATE query_cache SET hard_expires_at = expires_at WHERE hard_expires_at IS NULL OR hard_expires_at = now() + interval '60 minutes';
