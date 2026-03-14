@@ -78,6 +78,8 @@ from typing import List, Optional
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import pool as psycopg2_pool
+from contextlib import contextmanager, asynccontextmanager
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
@@ -137,22 +139,74 @@ logger.info("Loading embedding model '%s' …", EMBED_MODEL)
 model = SentenceTransformer(EMBED_MODEL)
 
 
-def _connect_db() -> psycopg2.extensions.connection:
+_db_pool: psycopg2_pool.ThreadedConnectionPool | None = None
+
+def _init_pool() -> psycopg2_pool.ThreadedConnectionPool:
+    """
+    Create the connection pool with retry logic matching the old _connect_db.
+    minconn=2 keeps two connections warm.
+    maxconn=10 safely fits uvicorn's default worker count plus background tasks.
+    autocommit is set per-connection at checkout time in get_db_conn().
+    """
     for attempt in range(1, 11):
         try:
-            conn = psycopg2.connect(_DB_DSN)
-            conn.autocommit = True
-            logger.info("Connected to search-db on attempt %d", attempt)
-            return conn
+            p = psycopg2_pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=10,
+                dsn=_DB_DSN,
+            )
+            logger.info("Connection pool created on attempt %d (min=2, max=10)", attempt)
+            return p
         except psycopg2.OperationalError as exc:
-            logger.warning("DB connect attempt %d/10 failed: %s", attempt, exc)
+            logger.warning("Pool init attempt %d/10 failed: %s", attempt, exc)
             time.sleep(min(2 ** (attempt - 1), 30))
-    raise RuntimeError("Could not connect to search-db after 10 attempts")
+    raise RuntimeError("Could not initialise connection pool after 10 attempts")
 
 
-db_conn = _connect_db()
+@contextmanager
+def get_db_conn():
+    """
+    Checkout one connection from the pool, yield it, then return it.
 
-app = FastAPI(title="search-service", version="5.0.0")
+    Design decisions:
+      - conn.autocommit = True mirrors the original single-connection behaviour.
+        Every cursor already commits implicitly; no explicit conn.commit() calls
+        exist in this file. Changing this would require auditing every call site.
+      - rollback() in the except branch resets any aborted-transaction state
+        before the connection goes back into the pool, preventing
+        InFailedSqlTransaction errors on the next checkout.
+      - PoolError → 503 so the caller gets a clean HTTP error, not a crash.
+    """
+    global _db_pool
+    try:
+        conn = _db_pool.getconn()
+    except psycopg2_pool.PoolError:
+        raise HTTPException(status_code=503, detail="Search temporarily unavailable — DB pool exhausted")
+    conn.autocommit = True
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        _db_pool.putconn(conn)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: initialise pool then start LISTEN daemon
+    global _db_pool
+    _db_pool = _init_pool()
+    _start_invalidation_listener()
+    yield
+    # Shutdown: close all pooled connections cleanly
+    if _db_pool:
+        _db_pool.closeall()
+        logger.info("Connection pool closed")
+
+app = FastAPI(title="search-service", version="5.0.0", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Query normalisation
@@ -376,25 +430,26 @@ def _l2_get(
     Returns an _L2Result with effective freshness (ACTIVE or SOFT_EXPIRED), or None.
     """
     try:
-        with db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                UPDATE query_cache
-                SET    hit_count   = hit_count + 1,
-                       last_hit_at = now()
-                WHERE  query_hash        = %s
-                  AND  filter_hash       = %s
-                  AND  sort_key          = %s
-                  AND  page_number       = %s
-                  AND  page_limit        = %s
-                  AND  hard_expires_at   > now()
-                  AND  freshness_status != 'HARD_EXPIRED'
-                RETURNING ordered_product_ids, result_count, response_meta,
-                          freshness_status, soft_expires_at, hard_expires_at
-                """,
-                (query_hash, filter_hash, sort_key, page_number, page_limit),
-            )
-            row = cur.fetchone()
+        with get_db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    UPDATE query_cache
+                    SET    hit_count   = hit_count + 1,
+                           last_hit_at = now()
+                    WHERE  query_hash        = %s
+                      AND  filter_hash       = %s
+                      AND  sort_key          = %s
+                      AND  page_number       = %s
+                      AND  page_limit        = %s
+                      AND  hard_expires_at   > now()
+                      AND  freshness_status != 'HARD_EXPIRED'
+                    RETURNING ordered_product_ids, result_count, response_meta,
+                              freshness_status, soft_expires_at, hard_expires_at
+                    """,
+                    (query_hash, filter_hash, sort_key, page_number, page_limit),
+                )
+                row = cur.fetchone()
         if row is None:
             return None
         eff = _effective_freshness(row["freshness_status"], row["soft_expires_at"])
@@ -444,71 +499,72 @@ def _l2_put(
     sem_meta_json = json.dumps(semantic_meta) if semantic_meta is not None else None
 
     try:
-        with db_conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO query_cache (
-                    normalized_query, query_hash, filter_hash, sort_key,
-                    page_number, page_limit,
-                    ordered_product_ids, result_count, response_meta,
-                    expires_at, status,
-                    lexical_signature, query_tokens, cache_version,
-                    query_embedding, semantic_source_query, semantic_similarity, semantic_meta,
-                    soft_expires_at, hard_expires_at, freshness_status,
-                    last_refresh_at, affected_product_ids,
-                    invalidation_reason, invalidated_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, 'ACTIVE',
-                    %s, %s, %s,
-                    %s::vector, %s, %s, %s,
-                    %s, %s, 'ACTIVE',
-                    now(), %s,
-                    NULL, NULL
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO query_cache (
+                        normalized_query, query_hash, filter_hash, sort_key,
+                        page_number, page_limit,
+                        ordered_product_ids, result_count, response_meta,
+                        expires_at, status,
+                        lexical_signature, query_tokens, cache_version,
+                        query_embedding, semantic_source_query, semantic_similarity, semantic_meta,
+                        soft_expires_at, hard_expires_at, freshness_status,
+                        last_refresh_at, affected_product_ids,
+                        invalidation_reason, invalidated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, 'ACTIVE',
+                        %s, %s, %s,
+                        %s::vector, %s, %s, %s,
+                        %s, %s, 'ACTIVE',
+                        now(), %s,
+                        NULL, NULL
+                    )
+                    ON CONFLICT (query_hash, filter_hash, sort_key, page_number, page_limit)
+                    DO UPDATE SET
+                        ordered_product_ids   = EXCLUDED.ordered_product_ids,
+                        result_count          = EXCLUDED.result_count,
+                        response_meta         = EXCLUDED.response_meta,
+                        expires_at            = EXCLUDED.expires_at,
+                        status                = 'ACTIVE',
+                        hit_count             = 0,
+                        last_hit_at           = NULL,
+                        created_at            = now(),
+                        lexical_signature     = EXCLUDED.lexical_signature,
+                        query_tokens          = EXCLUDED.query_tokens,
+                        cache_version         = EXCLUDED.cache_version,
+                        query_embedding       = COALESCE(EXCLUDED.query_embedding,       query_cache.query_embedding),
+                        semantic_source_query = COALESCE(EXCLUDED.semantic_source_query, query_cache.semantic_source_query),
+                        semantic_similarity   = COALESCE(EXCLUDED.semantic_similarity,   query_cache.semantic_similarity),
+                        semantic_meta         = COALESCE(EXCLUDED.semantic_meta,         query_cache.semantic_meta),
+                        soft_expires_at       = EXCLUDED.soft_expires_at,
+                        hard_expires_at       = EXCLUDED.hard_expires_at,
+                        freshness_status      = 'ACTIVE',
+                        last_refresh_at       = now(),
+                        affected_product_ids  = EXCLUDED.affected_product_ids,
+                        invalidation_reason   = NULL,
+                        invalidated_at        = NULL
+                    """,
+                    (
+                        normalized_query, query_hash, filter_hash, sort_key,
+                        page_number, page_limit,
+                        ordered_product_ids, result_count,
+                        json.dumps(response_meta), expires_at,
+                        normalized_query,       # lexical_signature
+                        tokens_json,
+                        cache_version,
+                        query_embedding_str,    # None → NULL::vector (valid)
+                        semantic_source_query,
+                        semantic_similarity,
+                        sem_meta_json,
+                        soft_expires,
+                        hard_expires,
+                        ordered_product_ids,    # affected_product_ids = ordered_product_ids
+                    ),
                 )
-                ON CONFLICT (query_hash, filter_hash, sort_key, page_number, page_limit)
-                DO UPDATE SET
-                    ordered_product_ids   = EXCLUDED.ordered_product_ids,
-                    result_count          = EXCLUDED.result_count,
-                    response_meta         = EXCLUDED.response_meta,
-                    expires_at            = EXCLUDED.expires_at,
-                    status                = 'ACTIVE',
-                    hit_count             = 0,
-                    last_hit_at           = NULL,
-                    created_at            = now(),
-                    lexical_signature     = EXCLUDED.lexical_signature,
-                    query_tokens          = EXCLUDED.query_tokens,
-                    cache_version         = EXCLUDED.cache_version,
-                    query_embedding       = COALESCE(EXCLUDED.query_embedding,       query_cache.query_embedding),
-                    semantic_source_query = COALESCE(EXCLUDED.semantic_source_query, query_cache.semantic_source_query),
-                    semantic_similarity   = COALESCE(EXCLUDED.semantic_similarity,   query_cache.semantic_similarity),
-                    semantic_meta         = COALESCE(EXCLUDED.semantic_meta,         query_cache.semantic_meta),
-                    soft_expires_at       = EXCLUDED.soft_expires_at,
-                    hard_expires_at       = EXCLUDED.hard_expires_at,
-                    freshness_status      = 'ACTIVE',
-                    last_refresh_at       = now(),
-                    affected_product_ids  = EXCLUDED.affected_product_ids,
-                    invalidation_reason   = NULL,
-                    invalidated_at        = NULL
-                """,
-                (
-                    normalized_query, query_hash, filter_hash, sort_key,
-                    page_number, page_limit,
-                    ordered_product_ids, result_count,
-                    json.dumps(response_meta), expires_at,
-                    normalized_query,       # lexical_signature
-                    tokens_json,
-                    cache_version,
-                    query_embedding_str,    # None → NULL::vector (valid)
-                    semantic_source_query,
-                    semantic_similarity,
-                    sem_meta_json,
-                    soft_expires,
-                    hard_expires,
-                    ordered_product_ids,    # affected_product_ids = ordered_product_ids
-                ),
-            )
         _metrics["writes"] += 1
     except psycopg2.Error as exc:
         logger.warning("L2 cache write error (non-fatal): %s", exc)
@@ -520,10 +576,11 @@ def _l2_cleanup_expired() -> None:
     Called opportunistically on each cache write — no dedicated scheduler needed.
     """
     try:
-        with db_conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM query_cache WHERE hard_expires_at < now() - interval '24 hours'"
-            )
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM query_cache WHERE hard_expires_at < now() - interval '24 hours'"
+                )
     except psycopg2.Error as exc:
         logger.debug("L2 cleanup error (non-fatal): %s", exc)
 
@@ -554,8 +611,9 @@ def _notify_invalidation(product_id: str, event_type: str, rows_updated: int) ->
         "rows":       rows_updated,
     })
     try:
-        with db_conn.cursor() as cur:
-            cur.execute("SELECT pg_notify('search_cache_invalidation', %s)", (payload,))
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_notify('search_cache_invalidation', %s)", (payload,))
     except psycopg2.Error as exc:
         logger.debug("NOTIFY failed (non-fatal): %s", exc)
 
@@ -575,22 +633,23 @@ def _invalidate_product(
     """
     new_status = _invalidation_severity(event_type, changed_fields)
     try:
-        with db_conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE query_cache
-                SET    freshness_status    = %s,
-                       invalidation_reason = %s,
-                       invalidated_at      = now()
-                WHERE  freshness_status = 'ACTIVE'
-                  AND  hard_expires_at  > now()
-                  AND  (
-                           %s = ANY(COALESCE(affected_product_ids, ordered_product_ids))
-                       )
-                """,
-                (new_status, event_type, product_id),
-            )
-            updated = cur.rowcount
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE query_cache
+                    SET    freshness_status    = %s,
+                           invalidation_reason = %s,
+                           invalidated_at      = now()
+                    WHERE  freshness_status = 'ACTIVE'
+                      AND  hard_expires_at  > now()
+                      AND  (
+                               %s = ANY(COALESCE(affected_product_ids, ordered_product_ids))
+                           )
+                    """,
+                    (new_status, event_type, product_id),
+                )
+                updated = cur.rowcount
 
         # Evict matching L1 entries immediately (no wait for NOTIFY round-trip)
         l1_evicted = _l1_evict_by_product_id(product_id)
@@ -807,8 +866,7 @@ def _start_invalidation_listener() -> None:
     logger.info("Invalidation listener thread started")
 
 
-# Start LISTEN/NOTIFY daemon at module load
-_start_invalidation_listener()
+# LISTEN/NOTIFY daemon is started inside the lifespan() context manager above.
 
 
 # ---------------------------------------------------------------------------
@@ -833,41 +891,42 @@ def _lexical_near_get(
     so the caller can compute effective freshness.
     """
     try:
-        with db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT normalized_query,
-                       ordered_product_ids,
-                       result_count,
-                       response_meta,
-                       query_tokens,
-                       freshness_status,
-                       soft_expires_at,
-                       hard_expires_at,
-                       similarity(normalized_query, %s) AS trgm_score
-                FROM query_cache
-                WHERE normalized_query  %% %s
-                  AND filter_hash        = %s
-                  AND sort_key           = %s
-                  AND page_number        = %s
-                  AND page_limit         = %s
-                  AND hard_expires_at    > now()
-                  AND freshness_status  != 'HARD_EXPIRED'
-                ORDER BY similarity(normalized_query, %s) DESC
-                LIMIT %s
-                """,
-                (
-                    normalized_query,
-                    normalized_query,
-                    filter_hash,
-                    sort_key,
-                    page_number,
-                    page_limit,
-                    normalized_query,
-                    LEXICAL_NEAR_MAX_CANDIDATES,
-                ),
-            )
-            rows = cur.fetchall()
+        with get_db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT normalized_query,
+                           ordered_product_ids,
+                           result_count,
+                           response_meta,
+                           query_tokens,
+                           freshness_status,
+                           soft_expires_at,
+                           hard_expires_at,
+                           similarity(normalized_query, %s) AS trgm_score
+                    FROM query_cache
+                    WHERE normalized_query  %% %s
+                      AND filter_hash        = %s
+                      AND sort_key           = %s
+                      AND page_number        = %s
+                      AND page_limit         = %s
+                      AND hard_expires_at    > now()
+                      AND freshness_status  != 'HARD_EXPIRED'
+                    ORDER BY similarity(normalized_query, %s) DESC
+                    LIMIT %s
+                    """,
+                    (
+                        normalized_query,
+                        normalized_query,
+                        filter_hash,
+                        sort_key,
+                        page_number,
+                        page_limit,
+                        normalized_query,
+                        LEXICAL_NEAR_MAX_CANDIDATES,
+                    ),
+                )
+                rows = cur.fetchall()
         return [dict(row) for row in rows]
     except psycopg2.Error as exc:
         logger.warning("Lexical-near candidate fetch error (non-fatal): %s", exc)
@@ -944,43 +1003,44 @@ def _semantic_get(
     Returns rows with freshness_status and soft_expires_at for Phase 4 checks.
     """
     try:
-        with db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    normalized_query,
-                    ordered_product_ids,
-                    result_count,
-                    query_tokens,
-                    freshness_status,
-                    soft_expires_at,
-                    hard_expires_at,
-                    query_embedding <=> %s::vector             AS cosine_distance,
-                    1 - (query_embedding <=> %s::vector)       AS semantic_similarity
-                FROM query_cache
-                WHERE query_embedding        IS NOT NULL
-                  AND hard_expires_at        > now()
-                  AND freshness_status      != 'HARD_EXPIRED'
-                  AND semantic_cache_enabled = TRUE
-                  AND filter_hash            = %s
-                  AND COALESCE(sort_key, '') = COALESCE(%s, '')
-                  AND page_number            = %s
-                  AND page_limit             = %s
-                ORDER BY query_embedding <=> %s::vector ASC
-                LIMIT %s
-                """,
-                (
-                    embedding_str,
-                    embedding_str,
-                    filter_hash,
-                    sort_key,
-                    page_number,
-                    page_limit,
-                    embedding_str,
-                    SEMANTIC_MAX_CANDIDATES,
-                ),
-            )
-            rows = cur.fetchall()
+        with get_db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        normalized_query,
+                        ordered_product_ids,
+                        result_count,
+                        query_tokens,
+                        freshness_status,
+                        soft_expires_at,
+                        hard_expires_at,
+                        query_embedding <=> %s::vector             AS cosine_distance,
+                        1 - (query_embedding <=> %s::vector)       AS semantic_similarity
+                    FROM query_cache
+                    WHERE query_embedding        IS NOT NULL
+                      AND hard_expires_at        > now()
+                      AND freshness_status      != 'HARD_EXPIRED'
+                      AND semantic_cache_enabled = TRUE
+                      AND filter_hash            = %s
+                      AND COALESCE(sort_key, '') = COALESCE(%s, '')
+                      AND page_number            = %s
+                      AND page_limit             = %s
+                    ORDER BY query_embedding <=> %s::vector ASC
+                    LIMIT %s
+                    """,
+                    (
+                        embedding_str,
+                        embedding_str,
+                        filter_hash,
+                        sort_key,
+                        page_number,
+                        page_limit,
+                        embedding_str,
+                        SEMANTIC_MAX_CANDIDATES,
+                    ),
+                )
+                rows = cur.fetchall()
         return [dict(row) for row in rows]
     except psycopg2.Error as exc:
         logger.warning("Semantic candidate fetch error (non-fatal): %s", exc)
@@ -1047,14 +1107,15 @@ def _hydrate(ordered_product_ids: list) -> list:
     if not ordered_product_ids:
         return []
     try:
-        with db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT product_id, denormalized_doc "
-                "FROM search_index "
-                "WHERE product_id = ANY(%s)",
-                (ordered_product_ids,),
-            )
-            rows = cur.fetchall()
+        with get_db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT product_id, denormalized_doc "
+                    "FROM search_index "
+                    "WHERE product_id = ANY(%s)",
+                    (ordered_product_ids,),
+                )
+                rows = cur.fetchall()
         doc_map = {row["product_id"]: row["denormalized_doc"] for row in rows}
         return [doc_map[pid] for pid in ordered_product_ids if pid in doc_map]
     except psycopg2.Error as exc:
@@ -1390,13 +1451,14 @@ def search(
     _metrics["misses"] += 1
     try:
         t_search = time.monotonic()
-        with db_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(HYBRID_SQL, {
-                "embedding": vec_str,
-                "query":     normalized,
-                "limit":     limit,
-            })
-            rows = cur.fetchall()
+        with get_db_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(HYBRID_SQL, {
+                    "embedding": vec_str,
+                    "query":     normalized,
+                    "limit":     limit,
+                })
+                rows = cur.fetchall()
         search_ms = int((time.monotonic() - t_search) * 1000)
 
         ordered_ids  = [row["product_id"] for row in rows]
