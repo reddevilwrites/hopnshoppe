@@ -8,7 +8,11 @@
       "Bash(curl:*)",
       "Bash(python -m json.tool:*)",
       "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); sources={}; [sources.__setitem__\\(p[''source''], sources.get\\(p[''source''],0\\)+1\\) for p in data]; print\\(''Total products:'', len\\(data\\)\\); print\\(''By source:'', json.dumps\\(sources, indent=2\\)\\)\")",
-      "Bash(python -c \"import sys,json; data=json.load\\(sys.stdin\\); sources={}; [sources.update\\({p[''source'']: sources.get\\(p[''source''],0\\)+1}\\) for p in data]; print\\(sources\\)\")"
+      "Bash(python -c \"import sys,json; data=json.load\\(sys.stdin\\); sources={}; [sources.update\\({p[''source'']: sources.get\\(p[''source''],0\\)+1}\\) for p in data]; print\\(sources\\)\")",
+      "Read(//cygdrive/c/Users/raymo/Documents/Upskill/Personal-Project/**)",
+      "Bash(python search-service/test_pool_concurrency.py)",
+      "Bash(python \"c:/Users/raymo/Documents/Upskill/Personal-Project/hopnshoppe/search-service/test_pool_concurrency.py\")",
+      "Bash(python -c \":*)"
     ]
   }
 }
