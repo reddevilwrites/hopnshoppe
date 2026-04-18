@@ -100,11 +100,11 @@ spring:
         # Incoming:  GET  /api/search?q=...
         # Forwarded: GET  /search?q=...
         #
-        # search-service is a Python FastAPI container (not Eureka-registered),
-        # so we route directly by container name instead of lb://search-service.
+        # search-service is a Python FastAPI container that self-registers with
+        # Eureka via its REST API, so lb:// resolution works like every other service.
         # -----------------------------------------------------------------------
         - id: search-service
-          uri: http://search-service:8085
+          uri: lb://search-service
           predicates:
             - Path=/api/search/**
           filters:

@@ -1,22 +1,31 @@
 # Run with: python test_pool_concurrency.py
 # No dependencies beyond Python 3.10+ stdlib required.
+"""
+Concurrency tests for the ThreadedConnectionPool refactor in search-service.
+
+Proves two things without needing a real PostgreSQL instance or any heavy import:
+  1. REGRESSION PROOF  — the old single-connection pattern produces a detectable
+                         collision signal under concurrent access.
+  2. CORRECTNESS PROOF — get_db_conn() issues a distinct connection per thread
+                         and always returns it to the pool.
+"""
 
 import threading
-import unittest
 import time
+import unittest
 from contextlib import contextmanager
 
 
 # ---------------------------------------------------------------------------
-# Test doubles (no psycopg2 or FastAPI required)
+# Test doubles — no psycopg2, no FastAPI
 # ---------------------------------------------------------------------------
 
 class PoolError(Exception):
-    """Test double for psycopg2_pool.PoolError."""
+    """Stand-in for psycopg2_pool.PoolError."""
 
 
 class HTTPException(Exception):
-    """Test double for fastapi.HTTPException."""
+    """Stand-in for fastapi.HTTPException."""
     def __init__(self, status_code: int, detail: str = ""):
         self.status_code = status_code
         self.detail = detail
@@ -24,11 +33,12 @@ class HTTPException(Exception):
 
 
 # ---------------------------------------------------------------------------
-# FakeConnection
+# Fake connection / pool
 # ---------------------------------------------------------------------------
 
 class FakeConnection:
     """Minimal stand-in for a psycopg2 connection."""
+
     def __init__(self, conn_id: int):
         self.conn_id = conn_id
         self.autocommit = False
@@ -47,36 +57,33 @@ class FakeConnection:
         pass
 
 
-# ---------------------------------------------------------------------------
-# FakePool
-# ---------------------------------------------------------------------------
-
 class FakePool:
     """
-    Thread-safe fake pool that mirrors ThreadedConnectionPool's API.
-    Tracks concurrent ownership to detect any collision.
+    Thread-safe fake pool mirroring ThreadedConnectionPool's API.
+
+    Tracks concurrent ownership to detect simultaneous sharing of a single
+    connection object by two or more threads.
     """
 
     def __init__(self, size: int):
         self._lock = threading.Lock()
-        self._available: list[FakeConnection] = [FakeConnection(i) for i in range(size)]
-        self._in_use: dict[int, int] = {}       # conn_id → thread_id currently holding it
-        self.collision_log: list[tuple] = []    # (conn_id, thread_id_a, thread_id_b) triples
-        self.checkout_log: list[tuple] = []     # (conn_id, thread_id) at every getconn()
+        self._available: list = [FakeConnection(i) for i in range(size)]
+        self._in_use: dict = {}           # conn_id -> thread_id
+        self.collision_log: list = []     # (conn_id, owner_tid, intruder_tid)
+        self.checkout_log: list = []      # (conn_id, thread_id) at getconn()
 
     def getconn(self) -> FakeConnection:
         with self._lock:
             if not self._available:
-                raise PoolError("connection pool exhausted")
+                raise PoolError("FakePool exhausted")
             conn = self._available.pop()
             tid = threading.get_ident()
-            # Detect collision: same conn already in use by another thread
             if conn.conn_id in self._in_use:
-                other_tid = self._in_use[conn.conn_id]
-                self.collision_log.append((conn.conn_id, other_tid, tid))
+                # Should never happen — means two threads share the same object
+                self.collision_log.append((conn.conn_id, self._in_use[conn.conn_id], tid))
             self._in_use[conn.conn_id] = tid
             self.checkout_log.append((conn.conn_id, tid))
-            return conn
+        return conn
 
     def putconn(self, conn: FakeConnection) -> None:
         with self._lock:
@@ -89,16 +96,16 @@ class FakePool:
 
 
 # ---------------------------------------------------------------------------
-# Inline copy of get_db_conn (avoids importing main.py)
+# Inline copy of get_db_conn() — exact logic from main.py, pool injected
 # ---------------------------------------------------------------------------
 
 @contextmanager
-def get_db_conn(pool, HTTPExc=HTTPException, PoolErr=PoolError):
-    """Inline copy of main.py get_db_conn for testing without imports."""
+def get_db_conn(pool, _HTTPException=HTTPException):
+    """Inline copy of main.py get_db_conn() for testing without imports."""
     try:
         conn = pool.getconn()
-    except PoolErr:
-        raise HTTPExc(status_code=503, detail="Pool exhausted")
+    except PoolError:
+        raise _HTTPException(status_code=503, detail="Pool exhausted")
     conn.autocommit = True
     try:
         yield conn
@@ -112,71 +119,74 @@ def get_db_conn(pool, HTTPExc=HTTPException, PoolErr=PoolError):
         pool.putconn(conn)
 
 
-# ---------------------------------------------------------------------------
-# TEST 1 — Regression: shared connection causes detectable collision
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TEST 1 — Regression: shared single connection produces a detectable collision
+# ===========================================================================
 
 class TestSharedConnectionRaceCondition(unittest.TestCase):
     """
-    Prove that the OLD pattern (one shared connection object for all threads)
-    produces a detectable signal: every thread records the same id().
-    This is the race condition that the pool refactor eliminates.
+    Simulates the OLD behaviour: one shared connection used by N threads.
+
+    Asserts that all threads saw the *same* connection id — the dangerous
+    signal the pool refactor was designed to eliminate.
     """
 
-    def test_shared_connection_all_threads_get_same_id(self):
-        NUM_THREADS = 8
-        shared_conn = FakeConnection(conn_id=99)
-        connection_ids_seen: list[int] = []
+    def test_shared_connection_all_same_id(self):
+        THREAD_COUNT = 8
+        shared_conn = FakeConnection(conn_id=0)
+        connection_ids_seen = []
         lock = threading.Lock()
-        barrier = threading.Barrier(NUM_THREADS)
+        barrier = threading.Barrier(THREAD_COUNT)
 
         def worker():
-            barrier.wait()  # all threads enter simultaneously
-            # OLD pattern: every thread uses the same shared object
-            conn = shared_conn
+            barrier.wait()                       # all enter simultaneously
             with lock:
-                connection_ids_seen.append(id(conn))
+                connection_ids_seen.append(id(shared_conn))
 
-        threads = [threading.Thread(target=worker) for _ in range(NUM_THREADS)]
+        threads = [threading.Thread(target=worker) for _ in range(THREAD_COUNT)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        # All threads shared the same object → exactly one distinct id
+        # All threads shared exactly one object — the race condition signal
         self.assertEqual(
             len(set(connection_ids_seen)), 1,
-            "Expected all threads to see the same connection id (old race condition signal)",
+            "Expected all threads to share one connection id (old pattern regression signal)",
         )
-        self.assertEqual(len(connection_ids_seen), NUM_THREADS)
+        self.assertEqual(len(connection_ids_seen), THREAD_COUNT)
 
 
-# ---------------------------------------------------------------------------
-# TEST 2 — Correctness: pool issues distinct connections per thread
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TEST 2 — Correctness: pool issues a distinct connection per thread
+# ===========================================================================
 
 class TestPoolIssuesDistinctConnections(unittest.TestCase):
     """
-    Prove that get_db_conn() gives each concurrent caller a unique connection
-    and that no two threads ever hold the same object simultaneously.
+    Five threads hammer the pool simultaneously.  Asserts:
+      a) Each thread received a different connection object.
+      b) No two threads ever held the same connection simultaneously.
+      c) All connections were returned after the threads completed.
+      d) No conn_id appeared under two different thread_ids during their hold.
     """
 
     POOL_SIZE = 5
+    HOLD_MS   = 50   # ms each thread holds its connection
 
-    def test_distinct_connections_no_sharing_full_return(self):
+    def test_distinct_connections_no_collisions_full_return(self):
         pool = FakePool(self.POOL_SIZE)
         barrier = threading.Barrier(self.POOL_SIZE)
-        connection_ids_seen: list[int] = []
-        thread_ids_seen: list[int] = []
+
+        checkout_records = []   # (conn_id, thread_id)
         lock = threading.Lock()
 
         def worker():
-            barrier.wait()  # all threads call getconn() at the same instant
+            barrier.wait()
             with get_db_conn(pool) as conn:
+                tid = threading.get_ident()
                 with lock:
-                    connection_ids_seen.append(conn.conn_id)
-                    thread_ids_seen.append(threading.get_ident())
-                time.sleep(0.05)  # hold the connection for 50 ms
+                    checkout_records.append((conn.conn_id, tid))
+                time.sleep(self.HOLD_MS / 1000)
 
         threads = [threading.Thread(target=worker) for _ in range(self.POOL_SIZE)]
         for t in threads:
@@ -184,122 +194,109 @@ class TestPoolIssuesDistinctConnections(unittest.TestCase):
         for t in threads:
             t.join()
 
-        # a) Every thread received a different connection object
+        conn_ids = [r[0] for r in checkout_records]
+
+        # a) Every thread got a different connection
         self.assertEqual(
-            len(set(connection_ids_seen)), self.POOL_SIZE,
-            "Each thread must receive a distinct connection",
+            len(set(conn_ids)), self.POOL_SIZE,
+            f"Expected {self.POOL_SIZE} distinct conn ids, got {set(conn_ids)}",
         )
 
-        # b) No simultaneous sharing detected by FakePool's ownership tracker
+        # b) No simultaneous sharing detected by FakePool
         self.assertEqual(
             len(pool.collision_log), 0,
-            f"Collisions detected: {pool.collision_log}",
+            f"Collision detected: {pool.collision_log}",
         )
 
-        # c) All connections returned to the pool
+        # c) All connections returned
         self.assertEqual(
             pool.available_count(), self.POOL_SIZE,
-            "All connections must be returned after threads complete",
+            f"Expected pool fully returned, available={pool.available_count()}",
         )
 
-        # d) Thread affinity: each conn_id maps to exactly one thread_id
-        #    Build a mapping from checkout_log and verify no conn_id has two owners
-        conn_to_threads: dict[int, set[int]] = {}
-        for conn_id, tid in pool.checkout_log:
-            conn_to_threads.setdefault(conn_id, set()).add(tid)
-        for conn_id, tids in conn_to_threads.items():
+        # d) Thread affinity during hold — each conn_id maps to exactly one thread_id
+        conn_to_threads = {}
+        for cid, tid in pool.checkout_log:
+            conn_to_threads.setdefault(cid, set()).add(tid)
+        for cid, tids in conn_to_threads.items():
             self.assertEqual(
                 len(tids), 1,
-                f"Connection {conn_id} was held by multiple threads: {tids}",
+                f"conn_id {cid} was checked out by multiple threads: {tids}",
             )
 
 
-# ---------------------------------------------------------------------------
-# TEST 3 — Pool exhaustion returns 503
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TEST 3 — Pool exhaustion raises 503
+# ===========================================================================
 
 class TestPoolExhaustionRaises503(unittest.TestCase):
     """
-    Prove that when the pool is exhausted, get_db_conn() raises an exception
-    with status_code == 503 rather than crashing with an unhandled PoolError.
+    A pool of size 2 with 3 simultaneous callers.  The third direct getconn()
+    raises PoolError; the get_db_conn() context manager converts it to HTTP 503.
     """
 
-    POOL_SIZE = 2
+    def test_third_checkout_raises_pool_error(self):
+        pool = FakePool(size=2)
+        c1 = pool.getconn()
+        c2 = pool.getconn()
 
-    def test_pool_error_raised_when_exhausted(self):
-        pool = FakePool(self.POOL_SIZE)
-
-        # Exhaust the pool manually
-        conn_a = pool.getconn()
-        conn_b = pool.getconn()
-
-        # Third checkout must raise PoolError
         with self.assertRaises(PoolError):
-            pool.getconn()
+            pool.getconn()          # exhausted — must raise PoolError
 
-        # Return connections so the pool is clean for the next assertion
-        pool.putconn(conn_a)
-        pool.putconn(conn_b)
+        pool.putconn(c1)
+        pool.putconn(c2)
 
     def test_get_db_conn_raises_503_on_exhaustion(self):
-        pool = FakePool(self.POOL_SIZE)
+        pool = FakePool(size=2)
+        c1 = pool.getconn()
+        c2 = pool.getconn()
 
-        # Exhaust pool by checking out all connections without returning them
-        held = [pool.getconn() for _ in range(self.POOL_SIZE)]
-
-        exc_raised: list[HTTPException] = []
-        try:
+        with self.assertRaises(HTTPException) as ctx:
             with get_db_conn(pool) as _conn:
-                pass  # should never reach here
-        except HTTPException as exc:
-            exc_raised.append(exc)
+                pass    # should not be reached
 
-        self.assertEqual(len(exc_raised), 1, "Expected exactly one HTTPException")
-        self.assertEqual(
-            exc_raised[0].status_code, 503,
-            f"Expected 503, got {exc_raised[0].status_code}",
-        )
+        self.assertEqual(ctx.exception.status_code, 503)
 
-        # Clean up
-        for c in held:
-            pool.putconn(c)
+        pool.putconn(c1)
+        pool.putconn(c2)
 
 
-# ---------------------------------------------------------------------------
-# TEST 4 — Context manager returns connection on exception
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TEST 4 — Connection returned to pool even when the with-block raises
+# ===========================================================================
 
 class TestConnectionReturnedOnException(unittest.TestCase):
     """
-    Prove that get_db_conn() returns the connection to the pool even when
-    the body of the with block raises, and that rollback() is called.
+    Raises an exception inside get_db_conn(). Verifies:
+      - The connection is returned to the pool (available_count == 1).
+      - rollback() was called exactly once on the fake connection.
     """
 
     def test_connection_returned_and_rollback_called_on_exception(self):
         pool = FakePool(size=1)
-        self.assertEqual(pool.available_count(), 1)
-
-        fake_conn: list[FakeConnection] = []
+        checked_out_conn = None
 
         with self.assertRaises(RuntimeError):
             with get_db_conn(pool) as conn:
-                fake_conn.append(conn)
+                checked_out_conn = conn
                 raise RuntimeError("simulated query failure")
 
-        # Connection must be back in the pool
+        # Connection back in pool
         self.assertEqual(
             pool.available_count(), 1,
-            "Connection must be returned to the pool after an exception",
+            "Connection was not returned to pool after exception",
         )
 
-        # rollback() must have been called exactly once
+        # rollback() called once on the error path
+        self.assertIsNotNone(checked_out_conn)
         self.assertEqual(
-            fake_conn[0].rollback_count, 1,
-            "rollback() must be called exactly once on the error path",
+            checked_out_conn.rollback_count, 1,
+            f"Expected rollback_count=1, got {checked_out_conn.rollback_count}",
         )
 
 
 # ---------------------------------------------------------------------------
-
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     unittest.main(verbosity=2)

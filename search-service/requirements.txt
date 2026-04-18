@@ -2,3 +2,5 @@ fastapi==0.111.0
 uvicorn==0.30.1
 psycopg2-binary==2.9.9
 sentence-transformers==3.1.1
+# kafka-python-ng: maintained fork of kafka-python with Python 3.12 support
+kafka-python-ng==2.2.3

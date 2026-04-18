@@ -13,7 +13,7 @@ A full-stack e-commerce demo built on a **microservices architecture** with aggr
 | user-service | 8084 | User profile management |
 | cart-service | 8082 | Cart state (database-per-service) |
 | catalog-service | 8083 | Product aggregator — AEM GraphQL + DummyJSON Marketplace |
-| search-service | 8085 | Hybrid search + 4-layer intelligent cache (FastAPI + pgvector) — v5.0.0 |
+| search-service | 8085 | Hybrid search + 4-layer intelligent cache (FastAPI + pgvector) — v6.0.0 |
 | ingestion-worker | — | Kafka consumer; generates embeddings and writes to search-db |
 | frontend | 5173→80 | React 19 SPA served by nginx |
 | auth-db | 5433 | PostgreSQL — credentials |
@@ -362,18 +362,18 @@ SEARCH_DB_PASSWORD=password KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python main.p
 
 ## Known limitations & Phase 5 candidates
 
-These are architectural gaps identified during development. None are implemented yet.
+These are architectural gaps identified during development. 6 of 8 are now implemented; 2 remain open.
 
 | Area | Issue | Suggested fix |
 |---|---|---|
-| **Thread safety** | `db_conn` is a single shared `psycopg2` connection; not thread-safe under concurrent FastAPI workers | Migrate to `psycopg2.pool.ThreadedConnectionPool` |
-| **Semantic HNSW index** | Phase 3 uses exact cosine scan on `query_cache` (no ANN index) | Enable HNSW index on `query_embedding` when table exceeds ~10k active rows |
-| **Adaptive TTL** | Soft/hard windows are fixed constants | Drive TTL from `hit_count` or time-of-day popularity signals |
-| **Brand/category conflict detection** | Semantic cache guards against price-intent conflicts but not brand or category conflicts | Add conflict term sets for brand names and categories |
+| **Thread safety** | `db_conn` was a single shared `psycopg2` connection; not thread-safe under concurrent FastAPI workers | ✅ Done — migrated to `psycopg2.pool.ThreadedConnectionPool` with a `get_db_conn()` context manager that checks out / returns connections safely across all threads |
+| **Semantic HNSW index** | Phase 3 uses exact cosine scan on `query_cache` (no ANN index); acceptable while the table stays under ~10k active rows | Enable HNSW index on `query_embedding` (scaffold already in `init.sql`, commented out) once `query_cache` regularly exceeds ~10k active rows and `sem_lookup_ms` latency appears in `/cache/stats` |
+| **Adaptive TTL** | Soft/hard windows were fixed constants | ✅ Done — TTL now scales with `hit_count` via `L2_SOFT_TTL_SECONDS × (1 + log10(max(hit_count, 1)))`, clamped to `L2_HARD_TTL_SECONDS`; toggled by `ADAPTIVE_TTL_ENABLED` |
+| **Brand/category conflict detection** | Semantic cache guarded against price-intent conflicts but not brand or category conflicts | ✅ Done — added `_has_brand_conflict()` and `_has_category_conflict()` with static `_BRAND_TERMS` / `_CATEGORY_GROUPS` term sets; both checks fire before similarity band evaluation in `_accept_semantic_candidate()` |
 | **Embedding backfill** | Rows written before Phase 3 have `query_embedding = NULL` and are excluded from semantic scan | One-time migration script using batch embed |
-| **Search gateway routing** | `search-service` uses a direct URI (`http://search-service:8085`) instead of `lb://` through Eureka | Register with Eureka for load-balanced routing |
-| **Automated Kafka → invalidation bridge** | `POST /internal/invalidate` is called manually; no automated bridge from Kafka product-updates events | Kafka consumer in search-service (or sidecar) to auto-invalidate on upstream events |
-| **Query cache size cap** | `query_cache` has no row-count ceiling; only TTL-based cleanup | Periodic job to cap at a max row count, evicting by `last_hit_at` |
+| **Search gateway routing** | `search-service` used a direct URI (`http://search-service:8085`) instead of `lb://` through Eureka | ✅ Done — `search-service` self-registers with Eureka via its REST API from a daemon thread (`_eureka_registration_loop`); gateway route changed to `lb://search-service`; `EUREKA_URI` injected via `docker-compose.yml` |
+| **Automated Kafka → invalidation bridge** | `POST /internal/invalidate` was called manually; no automated bridge from Kafka product-updates events | ✅ Done — `search-service` runs a dedicated `KafkaConsumer` thread subscribed to `product-updates`; `KAFKA_BOOTSTRAP_SERVERS` is injected via `docker-compose.yml` |
+| **Query cache size cap** | `query_cache` had no row-count ceiling; only TTL-based cleanup | ✅ Done — `_l2_cleanup_expired()` now includes an LRU eviction pass that caps the table at `QUERY_CACHE_MAX_ROWS` (default 50 000, env-configurable) by deleting the least-recently-accessed rows via `COALESCE(last_hit_at, created_at) ASC`; eviction count is tracked in the `cache_evictions_lru` metric |
 
 ## Security notes
 - Never commit `.env`, API keys, or JWT secrets.

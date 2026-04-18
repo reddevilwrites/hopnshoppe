@@ -73,6 +73,7 @@ import select
 import threading
 import time
 import math
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -81,6 +82,8 @@ import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as psycopg2_pool
 from contextlib import contextmanager, asynccontextmanager
+from kafka import KafkaConsumer
+from kafka.errors import NoBrokersAvailable
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
@@ -105,11 +108,32 @@ SEARCH_DB_PASSWORD = os.environ["SEARCH_DB_PASSWORD"]
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
+# ── Kafka consumer configuration ─────────────────────────────────────────────
+# KAFKA_BOOTSTRAP_SERVERS is injected via env (see docker-compose.yml).
+# KAFKA_GROUP_ID must differ from the ingestion-worker group so both consumers
+# receive every message independently — they serve different purposes.
+KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC     = "product-updates"
+KAFKA_GROUP_ID  = "search-service-cache-invalidator"
+
+# ── Eureka registration configuration ────────────────────────────────────────
+# EUREKA_URI is injected via env (see docker-compose.yml).
+# Uppercase app name is the Eureka convention; lb://search-service resolution
+# in the gateway is case-insensitive.
+EUREKA_URI           = os.environ.get("EUREKA_URI", "http://discovery-server:8761/eureka/")
+EUREKA_APP_NAME      = "SEARCH-SERVICE"
+EUREKA_INSTANCE_HOST = os.environ.get("EUREKA_HOSTNAME", "search-service")
+EUREKA_PORT          = 8085
+EUREKA_INSTANCE_ID   = f"{EUREKA_INSTANCE_HOST}:{EUREKA_PORT}"
+EUREKA_HEARTBEAT_S   = 30   # PUT every 30 s (Eureka default lease-renewal interval)
+EUREKA_LEASE_S       = 90   # deregister after 3 missed heartbeats
+
 # ── Cache TTL constants ─────────────────────────────────────────────────────
 L1_TTL_SECONDS      = 120     # 2 min — hot in-process cache (must be < soft TTL)
 L1_MAX_ENTRIES      = 500     # evict oldest 10% when ceiling is reached
 L2_SOFT_TTL_SECONDS = 600     # 10 min — ACTIVE window; SOFT_EXPIRED after this
 L2_HARD_TTL_SECONDS = 3600    # 60 min — hard barrier; HARD_EXPIRED rows never served
+QUERY_CACHE_MAX_ROWS = int(os.environ.get("QUERY_CACHE_MAX_ROWS", "50000"))
 
 # ── Adaptive TTL constants (Phase 5) ────────────────────────────────────────
 # soft_ttl = min(L2_SOFT_TTL_SECONDS * (1 + log10(max(hit_count, 1))),
@@ -209,8 +233,11 @@ async def lifespan(app: FastAPI):
     global _db_pool
     _db_pool = _init_pool()
     _start_invalidation_listener()
+    _start_kafka_invalidation_consumer()
+    _start_eureka_registration()
     yield
-    # Shutdown: close all pooled connections cleanly
+    # Shutdown: signal Eureka thread to deregister, then close pool
+    _eureka_stop.set()
     if _db_pool:
         _db_pool.closeall()
         logger.info("Connection pool closed")
@@ -256,6 +283,33 @@ _TOKEN_SPLIT = re.compile(r"[\s\-_/.,;:!?&'\"()\[\]{}]+")
 _BUDGET_TERMS  = frozenset({"cheap", "budget", "affordable", "inexpensive", "discount", "bargain"})
 _PREMIUM_TERMS = frozenset({"premium", "luxury", "expensive", "high-end", "designer", "deluxe", "exclusive"})
 
+# Brand conflict detection — mutually exclusive brand mentions signal different intents.
+_BRAND_TERMS = frozenset({
+    # Sportswear
+    "nike", "adidas", "puma", "reebok", "asics", "newbalance", "underarmour", "fila", "saucony",
+    # Fashion / Apparel
+    "zara", "hm", "gap", "levis", "gucci", "prada", "versace", "armani", "calvin", "tommy",
+    # Electronics
+    "apple", "samsung", "sony", "lg", "dell", "hp", "lenovo", "asus", "bose", "dyson",
+    # General retail / footwear
+    "vans", "converse", "timberland", "ugg", "crocs", "skechers",
+})
+
+# Category conflict detection — queries from different groups should never share a cache entry.
+# Each inner frozenset is one mutually exclusive category group.
+_CATEGORY_GROUPS: tuple = (
+    frozenset({"shoes", "sneakers", "boots", "sandals", "loafers", "heels", "flats", "slippers", "mules"}),
+    frozenset({"shorts", "pants", "trousers", "jeans", "leggings", "joggers", "chinos", "slacks"}),
+    frozenset({"shirt", "shirts", "tshirt", "tee", "blouse", "polo", "hoodie", "sweatshirt", "tank"}),
+    frozenset({"jacket", "coat", "parka", "blazer", "windbreaker", "vest", "cardigan"}),
+    frozenset({"dress", "dresses", "skirt", "skirts", "gown", "romper", "jumpsuit"}),
+    frozenset({"laptop", "laptops", "notebook", "macbook", "chromebook"}),
+    frozenset({"phone", "phones", "smartphone", "iphone", "android", "mobile"}),
+    frozenset({"headphones", "earbuds", "earphones", "airpods", "headset"}),
+    frozenset({"watch", "watches", "smartwatch", "fitbit"}),
+    frozenset({"bag", "bags", "backpack", "handbag", "purse", "tote", "satchel", "duffel"}),
+)
+
 
 def _tokenize(text: str) -> list:
     return [
@@ -295,6 +349,27 @@ def _has_price_intent_conflict(tokens_a: list, tokens_b: list) -> bool:
     b_budget  = bool(set_b & _BUDGET_TERMS)
     b_premium = bool(set_b & _PREMIUM_TERMS)
     return (a_budget and b_premium) or (a_premium and b_budget)
+
+
+def _has_brand_conflict(tokens_a: list, tokens_b: list) -> bool:
+    brands_a = set(tokens_a) & _BRAND_TERMS
+    brands_b = set(tokens_b) & _BRAND_TERMS
+    return bool(brands_a) and bool(brands_b) and brands_a != brands_b
+
+
+def _has_category_conflict(tokens_a: list, tokens_b: list) -> bool:
+    set_a, set_b = set(tokens_a), set(tokens_b)
+    for group in _CATEGORY_GROUPS:
+        a_in = bool(set_a & group)
+        b_in = bool(set_b & group)
+        if a_in != b_in:
+            # one query is in this category group, the other is not —
+            # check if the other falls in a different group
+            other_set = set_b if a_in else set_a
+            for other_group in _CATEGORY_GROUPS:
+                if other_group is not group and bool(other_set & other_group):
+                    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +416,27 @@ _l1_cache: dict = {}
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
-_metrics = {
+class _MetricsCounter:
+    """Thread-safe counter map; safe under no-GIL Python (PEP 703)."""
+
+    def __init__(self, initial: dict) -> None:
+        self._lock = threading.Lock()
+        self._data = dict(initial)
+
+    def increment(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            self._data[key] += n
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._data)
+
+    def __getitem__(self, key: str):
+        with self._lock:
+            return self._data[key]
+
+
+_metrics = _MetricsCounter({
     # Phase 1–3 counters
     "l1_hits":                   0,
     "l2_hits":                   0,
@@ -363,7 +458,12 @@ _metrics = {
     "invalidation_events":       0,
     "invalidated_rows":          0,
     "l1_evictions_from_notify":  0,
-}
+    # Kafka invalidation counters (Phase 5)
+    "kafka_events_received":     0,   # total messages consumed from product-updates
+    "kafka_invalidations_ok":    0,   # events that successfully called _invalidate_product
+    "kafka_events_skipped":      0,   # malformed events (missing 'id') or processing errors
+    "cache_evictions_lru":       0,   # rows evicted by LRU pass in _l2_cleanup_expired
+})
 
 
 def _l1_get(query_hash: str) -> Optional["_L1Entry"]:
@@ -637,15 +737,16 @@ def _l2_put(
                         ordered_product_ids,    # affected_product_ids = ordered_product_ids
                     ),
                 )
-        _metrics["writes"] += 1
+        _metrics.increment("writes")
     except psycopg2.Error as exc:
         logger.warning("L2 cache write error (non-fatal): %s", exc)
 
 
 def _l2_cleanup_expired() -> None:
     """
-    Lazily delete rows that have been hard-expired for more than 24 hours.
-    Called opportunistically on each cache write — no dedicated scheduler needed.
+    Lazily delete rows that have been hard-expired for more than 24 hours,
+    then evict the least-recently-accessed rows if the table exceeds
+    QUERY_CACHE_MAX_ROWS. Called opportunistically on each cache write.
     """
     try:
         with get_db_conn() as conn:
@@ -655,6 +756,29 @@ def _l2_cleanup_expired() -> None:
                 )
     except psycopg2.Error as exc:
         logger.debug("L2 cleanup error (non-fatal): %s", exc)
+
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM query_cache")
+                (total,) = cur.fetchone()
+                excess = total - QUERY_CACHE_MAX_ROWS
+                if excess > 0:
+                    cur.execute(
+                        """
+                        DELETE FROM query_cache
+                        WHERE cache_id IN (
+                            SELECT cache_id FROM query_cache
+                            ORDER BY COALESCE(last_hit_at, created_at) ASC
+                            LIMIT %s
+                        )
+                        """,
+                        (excess,),
+                    )
+                    _metrics.increment("cache_evictions_lru", excess)
+                    logger.info("LRU eviction removed %d rows from query_cache", excess)
+    except psycopg2.Error as exc:
+        logger.debug("L2 LRU eviction error (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -726,9 +850,9 @@ def _invalidate_product(
         # Evict matching L1 entries immediately (no wait for NOTIFY round-trip)
         l1_evicted = _l1_evict_by_product_id(product_id)
 
-        _metrics["invalidation_events"] += 1
-        _metrics["invalidated_rows"]    += updated
-        _metrics["l1_evictions_from_notify"] += l1_evicted
+        _metrics.increment("invalidation_events")
+        _metrics.increment("invalidated_rows",          updated)
+        _metrics.increment("l1_evictions_from_notify",  l1_evicted)
 
         logger.info(
             "Invalidation — product_id=%r event=%s target_status=%s "
@@ -762,7 +886,7 @@ def _refresh_cache_entry(
     Called asynchronously after response is sent — uses its own DB connection
     to avoid contention with the main request connection.
     """
-    _metrics["refresh_triggers"] += 1
+    _metrics.increment("refresh_triggers")
     refresh_conn = None
     try:
         refresh_conn = psycopg2.connect(_DB_DSN)
@@ -857,13 +981,13 @@ def _refresh_cache_entry(
             freshness_status="ACTIVE",
         )
 
-        _metrics["refresh_successes"] += 1
+        _metrics.increment("refresh_successes")
         logger.info(
             "Background refresh OK — normalized=%r results=%d",
             normalized, result_count,
         )
     except Exception as exc:
-        _metrics["refresh_failures"] += 1
+        _metrics.increment("refresh_failures")
         logger.warning("Background refresh failed — normalized=%r error=%s", normalized, exc)
     finally:
         if refresh_conn:
@@ -883,7 +1007,7 @@ def _handle_invalidation_notify(payload: str) -> None:
         product_id = data.get("product_id")
         if product_id:
             evicted = _l1_evict_by_product_id(product_id)
-            _metrics["l1_evictions_from_notify"] += evicted
+            _metrics.increment("l1_evictions_from_notify", evicted)
             if evicted:
                 logger.info(
                     "NOTIFY L1 eviction — product_id=%r evicted=%d",
@@ -928,7 +1052,7 @@ def _invalidation_listener_loop() -> None:
                     pass
 
 
-def _start_invalidation_listener() -> None:
+def _start_invalidation_listener_thread() -> None:
     t = threading.Thread(
         target=_invalidation_listener_loop,
         daemon=True,
@@ -937,8 +1061,224 @@ def _start_invalidation_listener() -> None:
     t.start()
     logger.info("Invalidation listener thread started")
 
+# Public alias preserving the original callable name.
+_start_invalidation_listener = _start_invalidation_listener_thread
 
-# LISTEN/NOTIFY daemon is started inside the lifespan() context manager above.
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Kafka invalidation consumer (closes the Kafka → cache gap)
+# ---------------------------------------------------------------------------
+def _kafka_invalidation_consumer_loop() -> None:
+    """
+    Daemon thread: consumes from 'product-updates' and calls _invalidate_product()
+    for every event, mirroring the invalidation that ingestion-worker triggers on
+    search_index so that query_cache entries are marked stale within seconds rather
+    than waiting for the hard TTL (60 min).
+
+    Offset reset policy: 'latest'
+      On restart we skip events published during the downtime window. This is the
+      right trade-off because:
+        - Replaying old events triggers unnecessary invalidations on an already-fresh
+          or already-hard-expired cache (no benefit).
+        - The worst-case staleness equals the hard TTL (60 min), which is the
+          pre-feature baseline — we never make things worse than before this feature.
+        - On first boot the cache is empty, so there is nothing to invalidate anyway.
+
+    Consumer group: KAFKA_GROUP_ID (distinct from the ingestion-worker group) so both
+    consumers receive every message independently and do not compete for partition assignments.
+
+    Resilience:
+      - NoBrokersAvailable on startup: logged and retried with exponential backoff.
+      - Any per-event exception: logged and skipped (consumer loop continues).
+      - Any consumer-level exception: logged, consumer closed, backoff, reconnect.
+      - _invalidate_product() checks out and returns pool connections internally;
+        no pool connection is held while blocked waiting for Kafka messages.
+    """
+    backoff = 5  # initial retry delay in seconds
+    while True:
+        consumer = None
+        try:
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                group_id=KAFKA_GROUP_ID,
+                value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+                auto_offset_reset="latest",
+                enable_auto_commit=True,
+                session_timeout_ms=30_000,
+                heartbeat_interval_ms=10_000,
+            )
+            logger.info(
+                "Kafka invalidation consumer connected — topic=%s group=%s broker=%s",
+                KAFKA_TOPIC, KAFKA_GROUP_ID, KAFKA_BOOTSTRAP,
+            )
+            backoff = 5  # reset backoff on successful connection
+            for message in consumer:
+                try:
+                    event = message.value
+                    _metrics.increment("kafka_events_received")
+
+                    # Event field: 'id' — matches ingestion-worker producer contract.
+                    # Using wrong field name here causes silent skip on every event.
+                    product_id = event.get("id")
+                    if not product_id:
+                        _metrics.increment("kafka_events_skipped")
+                        logger.debug(
+                            "Kafka event skipped — missing 'id' field, keys=%s",
+                            list(event.keys()) if isinstance(event, dict) else type(event),
+                        )
+                        continue
+
+                    event_type     = (event.get("eventType") or "FULL_UPDATE").upper()
+                    # changedFields is not produced by ingestion-worker today; included
+                    # for forward-compatibility if the event contract is extended.
+                    changed_fields = event.get("changedFields")
+
+                    _invalidate_product(product_id, event_type, changed_fields)
+                    _metrics.increment("kafka_invalidations_ok")
+                    logger.debug(
+                        "Kafka invalidation OK — product_id=%r event_type=%s",
+                        product_id, event_type,
+                    )
+
+                except Exception as exc:
+                    _metrics.increment("kafka_events_skipped")
+                    logger.warning(
+                        "Kafka event processing error (event skipped): %s", exc,
+                    )
+
+        except NoBrokersAvailable:
+            logger.warning(
+                "Kafka not available — retrying in %ds (broker=%s)",
+                backoff, KAFKA_BOOTSTRAP,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Kafka invalidation consumer error — retrying in %ds: %s", backoff, exc,
+            )
+        finally:
+            if consumer is not None:
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 120)  # exponential backoff, cap at 2 min
+
+
+def _start_kafka_invalidation_consumer() -> None:
+    t = threading.Thread(
+        target=_kafka_invalidation_consumer_loop,
+        daemon=True,
+        name="kafka-invalidation-consumer",
+    )
+    t.start()
+    logger.info("Kafka invalidation consumer thread started — topic=%s", KAFKA_TOPIC)
+
+
+# ---------------------------------------------------------------------------
+# Eureka registration — daemon thread registers, heartbeats, and deregisters
+# ---------------------------------------------------------------------------
+_eureka_stop = threading.Event()
+
+
+def _eureka_registration_loop() -> None:
+    """
+    Daemon thread: registers this instance with Eureka on startup, sends a
+    heartbeat PUT every EUREKA_HEARTBEAT_S seconds, and handles unavailability
+    with exponential backoff. The main request path is never blocked — if Eureka
+    is down the gateway falls back to its hardcoded URI.
+    """
+    registration_payload = json.dumps({
+        "instance": {
+            "instanceId":       EUREKA_INSTANCE_ID,
+            "hostName":         EUREKA_INSTANCE_HOST,
+            "app":              EUREKA_APP_NAME,
+            "ipAddr":           EUREKA_INSTANCE_HOST,
+            "status":           "UP",
+            "overriddenStatus": "UNKNOWN",
+            "port":             {"$": EUREKA_PORT, "@enabled": "true"},
+            "securePort":       {"$": 443,         "@enabled": "false"},
+            "healthCheckUrl":   f"http://{EUREKA_INSTANCE_HOST}:{EUREKA_PORT}/health",
+            "statusPageUrl":    f"http://{EUREKA_INSTANCE_HOST}:{EUREKA_PORT}/health",
+            "homePageUrl":      f"http://{EUREKA_INSTANCE_HOST}:{EUREKA_PORT}/",
+            "dataCenterInfo":   {
+                "@class": "com.netflix.appinfo.InstanceInfo$DefaultDataCenterInfo",
+                "name":   "MyOwn",
+            },
+            "leaseInfo": {
+                "renewalIntervalInSecs": EUREKA_HEARTBEAT_S,
+                "durationInSecs":        EUREKA_LEASE_S,
+            },
+            "metadata": {"management.port": str(EUREKA_PORT)},
+            "vipAddress":       EUREKA_APP_NAME,
+            "secureVipAddress": EUREKA_APP_NAME,
+            "isCoordinatingDiscoveryServer": "false",
+        }
+    }).encode()
+
+    register_url   = f"{EUREKA_URI.rstrip('/')}/apps/{EUREKA_APP_NAME}"
+    heartbeat_url  = f"{register_url}/{EUREKA_INSTANCE_ID}"
+    registered     = False
+    backoff        = 5  # initial retry delay in seconds
+
+    while not _eureka_stop.is_set():
+        try:
+            if not registered:
+                req = urllib.request.Request(
+                    register_url,
+                    data=registration_payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status in (200, 204):
+                        registered = True
+                        backoff    = 5
+                        logger.info(
+                            "Registered with Eureka — app=%s instanceId=%s",
+                            EUREKA_APP_NAME, EUREKA_INSTANCE_ID,
+                        )
+            else:
+                req = urllib.request.Request(heartbeat_url, method="PUT")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 404:
+                        # Eureka lost our registration (restart/eviction); re-register.
+                        registered = False
+                        logger.warning("Eureka heartbeat 404 — re-registering")
+                        continue
+
+        except Exception as exc:
+            logger.debug("Eureka %s error (non-fatal): %s",
+                         "registration" if not registered else "heartbeat", exc)
+            if not registered:
+                _eureka_stop.wait(backoff)
+                backoff = min(backoff * 2, 120)
+                continue
+
+        _eureka_stop.wait(EUREKA_HEARTBEAT_S)
+
+    # Graceful deregistration on shutdown.
+    try:
+        req = urllib.request.Request(heartbeat_url, method="DELETE")
+        urllib.request.urlopen(req, timeout=5)
+        logger.info("Deregistered from Eureka — instanceId=%s", EUREKA_INSTANCE_ID)
+    except Exception as exc:
+        logger.debug("Eureka deregistration error (non-fatal): %s", exc)
+
+
+def _start_eureka_registration() -> None:
+    t = threading.Thread(
+        target=_eureka_registration_loop,
+        daemon=True,
+        name="eureka-registration",
+    )
+    t.start()
+    logger.info("Eureka registration thread started — app=%s uri=%s", EUREKA_APP_NAME, EUREKA_URI)
+
+
+# LISTEN/NOTIFY daemon, Kafka consumer, and Eureka registration are started inside lifespan() above.
 
 
 # ---------------------------------------------------------------------------
@@ -1154,6 +1494,14 @@ def _accept_semantic_candidate(
         stats["reject_reason"] = "price_intent_conflict"
         return False, stats
 
+    if _has_brand_conflict(incoming_tokens, candidate_tokens):
+        stats["reject_reason"] = "brand_conflict"
+        return False, stats
+
+    if _has_category_conflict(incoming_tokens, candidate_tokens):
+        stats["reject_reason"] = "category_conflict"
+        return False, stats
+
     if similarity >= SEMANTIC_STRONG_ACCEPT:
         stats["band"] = "strong"
         return True, stats
@@ -1277,17 +1625,17 @@ def search(
     # ── Step 3: L1 in-process cache ──────────────────────────────────────────
     l1_entry = _l1_get(query_hash)
     if l1_entry is not None:
-        _metrics["l1_hits"] += 1
+        _metrics.increment("l1_hits")
         eff = l1_entry.freshness_status     # ACTIVE or SOFT_EXPIRED (HARD_EXPIRED evicted)
         if eff == "SOFT_EXPIRED":
-            _metrics["soft_expired_cache_hits"] += 1
+            _metrics.increment("soft_expired_cache_hits")
             background_tasks.add_task(
                 _refresh_cache_entry,
                 normalized, query_hash, filter_hash, sort_key,
                 page_number, page_limit, incoming_tokens,
             )
         else:
-            _metrics["active_cache_hits"] += 1
+            _metrics.increment("active_cache_hits")
 
         docs       = _hydrate(l1_entry.ordered_product_ids)
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
@@ -1305,15 +1653,15 @@ def search(
     if l2_result is not None:
         eff = l2_result.freshness_status    # ACTIVE or SOFT_EXPIRED
         if eff == "SOFT_EXPIRED":
-            _metrics["soft_expired_cache_hits"] += 1
+            _metrics.increment("soft_expired_cache_hits")
             background_tasks.add_task(
                 _refresh_cache_entry,
                 normalized, query_hash, filter_hash, sort_key,
                 page_number, page_limit, incoming_tokens,
             )
         else:
-            _metrics["active_cache_hits"] += 1
-        _metrics["l2_hits"] += 1
+            _metrics.increment("active_cache_hits")
+        _metrics.increment("l2_hits")
 
         docs = _hydrate(l2_result.ordered_product_ids)
         _l1_put(
@@ -1348,12 +1696,12 @@ def search(
         )
         # HARD_EXPIRED candidates are skipped regardless of similarity
         if cand_eff == "HARD_EXPIRED":
-            _metrics["hard_expired_rejects"] += 1
+            _metrics.increment("hard_expired_rejects")
             continue
 
         accepted, accept_stats = _accept_lexical_near_candidate(incoming_tokens, candidate)
         if not accepted:
-            _metrics["lexical_near_rejects"] += 1
+            _metrics.increment("lexical_near_rejects")
             logger.info(
                 "Lexical-near REJECT — normalized=%r candidate=%r "
                 "trgm_score=%.4f reason=%s",
@@ -1364,11 +1712,11 @@ def search(
             )
             continue
 
-        _metrics["lexical_near_hits"] += 1
+        _metrics.increment("lexical_near_hits")
         if cand_eff == "SOFT_EXPIRED":
-            _metrics["soft_expired_cache_hits"] += 1
+            _metrics.increment("soft_expired_cache_hits")
         else:
-            _metrics["active_cache_hits"] += 1
+            _metrics.increment("active_cache_hits")
 
         ordered_ids  = list(candidate["ordered_product_ids"])
         docs         = _hydrate(ordered_ids)
@@ -1418,7 +1766,7 @@ def search(
         embedding = model.encode(normalized).tolist()
         vec_str   = _vec_str(embedding)
         embed_ms  = int((time.monotonic() - t_embed) * 1000)
-        _metrics["embeddings_computed"] += 1
+        _metrics.increment("embeddings_computed")
     except Exception as exc:
         logger.error("Embedding computation failed: %s", exc)
         raise HTTPException(status_code=503, detail="Embedding service unavailable")
@@ -1434,7 +1782,7 @@ def search(
     )
 
     for sem_candidate in sem_candidates:
-        _metrics["semantic_candidates_seen"] += 1
+        _metrics.increment("semantic_candidates_seen")
 
         # Phase 4: compute effective freshness of this semantic candidate
         cand_eff = _effective_freshness(
@@ -1442,12 +1790,12 @@ def search(
             sem_candidate.get("soft_expires_at"),
         )
         if cand_eff == "HARD_EXPIRED":
-            _metrics["hard_expired_rejects"] += 1
+            _metrics.increment("hard_expired_rejects")
             continue
 
         accepted, sem_stats = _accept_semantic_candidate(incoming_tokens, sem_candidate)
         if not accepted:
-            _metrics["semantic_rejects"] += 1
+            _metrics.increment("semantic_rejects")
             logger.info(
                 "Semantic REJECT — normalized=%r candidate=%r similarity=%.4f reason=%s",
                 normalized,
@@ -1457,11 +1805,11 @@ def search(
             )
             continue
 
-        _metrics["semantic_hits"] += 1
+        _metrics.increment("semantic_hits")
         if cand_eff == "SOFT_EXPIRED":
-            _metrics["soft_expired_cache_hits"] += 1
+            _metrics.increment("soft_expired_cache_hits")
         else:
-            _metrics["active_cache_hits"] += 1
+            _metrics.increment("active_cache_hits")
 
         ordered_ids = list(sem_candidate["ordered_product_ids"])
         docs        = _hydrate(ordered_ids)
@@ -1520,7 +1868,7 @@ def search(
         }
 
     # ── Step 7: Cache miss — run full hybrid search ───────────────────────────
-    _metrics["misses"] += 1
+    _metrics.increment("misses")
     try:
         t_search = time.monotonic()
         with get_db_conn() as conn:
@@ -1678,6 +2026,7 @@ def cache_stats():
         # L2 TTLs (Phase 4)
         "l2_soft_ttl_seconds":         L2_SOFT_TTL_SECONDS,
         "l2_hard_ttl_seconds":         L2_HARD_TTL_SECONDS,
+        "query_cache_max_rows":        QUERY_CACHE_MAX_ROWS,
         # Adaptive TTL config (Phase 5)
         "adaptive_ttl_enabled":        ADAPTIVE_TTL_ENABLED,
         "adaptive_ttl_ceiling_s":      ADAPTIVE_TTL_CEILING,
@@ -1690,7 +2039,7 @@ def cache_stats():
         "semantic_borderline_low":     SEMANTIC_BORDERLINE_LOW,
         "semantic_max_candidates":     SEMANTIC_MAX_CANDIDATES,
         # All counters
-        **_metrics,
+        **_metrics.snapshot(),
         # Derived
         "total_requests":              total_requests,
         "embedding_skips":             _metrics["lexical_near_hits"],

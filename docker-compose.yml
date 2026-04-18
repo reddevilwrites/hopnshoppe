@@ -250,7 +250,7 @@ services:
       - "5436:5432"
     volumes:
       - pgdata-search:/var/lib/postgresql/data
-      - ./search-service/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./search-service/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro  # consumed by search-service; kafka consumer triggers invalidation writes here
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d search_db"]
       interval: 10s
@@ -290,13 +290,19 @@ services:
     build: ./search-service
     container_name: hopnshoppe-search-service
     depends_on:
+      discovery-server:
+        condition: service_healthy
       search-db:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     environment:
       SEARCH_DB_HOST: search-db
       SEARCH_DB_NAME: search_db
       SEARCH_DB_USER: ${POSTGRES_USER:-postgres}
       SEARCH_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      EUREKA_URI: http://discovery-server:8761/eureka/
     ports:
       - "8085:8085"
     restart: on-failure
