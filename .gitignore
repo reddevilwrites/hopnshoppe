@@ -4,6 +4,7 @@
 .env
 .env.*
 *.local
+*Observability.md
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Maven build output (all modules)

@@ -47,12 +47,26 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
 from bs4 import BeautifulSoup
 from kafka import KafkaConsumer, KafkaProducer
+from prometheus_client import Counter, Gauge, start_http_server
 from sentence_transformers import SentenceTransformer
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+    from opentelemetry.instrumentation.kafka import KafkaInstrumentor
+    _OTEL_AVAILABLE = True
+except ImportError:
+    _OTEL_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -61,6 +75,38 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
 )
+class _JsonLogFormatter(logging.Formatter):
+    """Emit JSON logs with trace/span correlation when available."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "service": "ingestion-worker",
+        }
+
+        otel_trace = globals().get("trace")
+        if otel_trace is not None:
+            try:
+                span = otel_trace.get_current_span()
+                ctx = span.get_span_context()
+                if ctx is not None and ctx.is_valid:
+                    payload["trace_id"] = format(ctx.trace_id, "032x")
+                    payload["span_id"] = format(ctx.span_id, "016x")
+            except Exception:
+                pass
+
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, ensure_ascii=True)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonLogFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 logger = logging.getLogger("ingestion-worker")
 
 # ---------------------------------------------------------------------------
@@ -76,14 +122,95 @@ SEARCH_DB_NAME     = os.environ.get("SEARCH_DB_NAME", "search_db")
 SEARCH_DB_USER     = os.environ.get("SEARCH_DB_USER", "postgres")
 SEARCH_DB_PASSWORD = os.environ["SEARCH_DB_PASSWORD"]
 
-EMBED_MODEL        = "all-MiniLM-L6-v2"   # 384-dimensional, lightweight, fast
+EMBED_MODEL        = os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 KAFKA_READY_WAIT   = 15                    # seconds before starting consumer
+METRICS_PORT       = int(os.environ.get("METRICS_PORT", "9108"))
+
+INGESTION_EVENTS_TOTAL = Counter(
+    "ingestion_worker_events_total",
+    "Kafka events processed by event type and outcome.",
+    ["event_type", "outcome"],
+)
+INGESTION_DB_CONNECTED = Gauge(
+    "ingestion_worker_db_connected",
+    "Whether ingestion-worker currently has an open database connection.",
+)
+
+# ---------------------------------------------------------------------------
+# Distributed tracing — initialised before DB connection and Kafka consumer
+# ---------------------------------------------------------------------------
+def _init_tracing() -> None:
+    """
+    Set up OpenTelemetry tracing with psycopg2 and Kafka auto-instrumentation.
+    A missing endpoint or ImportError is non-fatal — the worker continues normally.
+    """
+    if not _OTEL_AVAILABLE:
+        logger.info("OTel packages not installed — tracing disabled")
+        return
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    if not endpoint:
+        logger.info("OTEL_EXPORTER_OTLP_ENDPOINT not set — tracing disabled")
+        return
+    try:
+        service_name = os.environ.get("OTEL_SERVICE_NAME", "ingestion-worker")
+        resource     = Resource({"service.name": service_name})
+        provider     = TracerProvider(resource=resource)
+        exporter     = OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces")
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        trace.set_tracer_provider(provider)
+        Psycopg2Instrumentor().instrument()
+        KafkaInstrumentor().instrument()
+        logger.info("OTel tracing enabled — endpoint=%s service=%s", endpoint, service_name)
+    except Exception as exc:
+        logger.warning("OTel tracing init failed (non-fatal): %s", exc)
+
+
+_init_tracing()
 
 # ---------------------------------------------------------------------------
 # Startup — load model and connect to search-db (with retry)
 # ---------------------------------------------------------------------------
 logger.info("Loading embedding model '%s' …", EMBED_MODEL)
 model = SentenceTransformer(EMBED_MODEL)
+MODEL_EMBED_DIM = int(model.get_sentence_embedding_dimension())
+logger.info("Embedding model dimension resolved to %d", MODEL_EMBED_DIM)
+
+
+def _get_vector_dimension(
+    conn: psycopg2.extensions.connection,
+    table_name: str,
+    column_name: str,
+) -> int | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT a.atttypmod
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = %s
+              AND a.attname = %s
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            """,
+            (table_name, column_name),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    dim = row[0]
+    return int(dim) if dim and dim > 0 else None
+
+
+def _validate_embedding_schema(conn: psycopg2.extensions.connection) -> None:
+    db_dim = _get_vector_dimension(conn, "search_index", "embedding")
+    if db_dim is None:
+        raise RuntimeError("search_index.embedding column is missing")
+    if db_dim != MODEL_EMBED_DIM:
+        raise RuntimeError(
+            f"search_index.embedding dimension mismatch: db={db_dim} model={MODEL_EMBED_DIM}"
+        )
+    logger.info("search_index.embedding dimension verified — db=%d model=%d", db_dim, MODEL_EMBED_DIM)
 
 
 def _connect_db() -> psycopg2.extensions.connection:
@@ -96,7 +223,9 @@ def _connect_db() -> psycopg2.extensions.connection:
         try:
             conn = psycopg2.connect(dsn)
             conn.autocommit = False
+            _validate_embedding_schema(conn)
             logger.info("Connected to search-db on attempt %d", attempt)
+            INGESTION_DB_CONNECTED.set(1)
             return conn
         except psycopg2.OperationalError as exc:
             logger.warning("DB connect attempt %d/10 failed: %s", attempt, exc)
@@ -288,6 +417,7 @@ def _send_to_dlq(event: dict, reason: str) -> None:
 def process_event(event: dict) -> None:
     product_id = event.get("id")
     if not product_id:
+        INGESTION_EVENTS_TOTAL.labels(event_type="UNKNOWN", outcome="skipped").inc()
         logger.warning("Malformed event — missing 'id'. Skipping: %s", event)
         return
 
@@ -295,6 +425,7 @@ def process_event(event: dict) -> None:
 
     if event_type == "FULL_UPDATE":
         if not event.get("name"):
+            INGESTION_EVENTS_TOTAL.labels(event_type=event_type, outcome="dlq").inc()
             logger.warning(
                 "Malformed FULL_UPDATE — missing 'name' for id='%s'. Sending to DLQ.", product_id
             )
@@ -302,17 +433,21 @@ def process_event(event: dict) -> None:
             return
         doc = _build_denormalized_doc(event)
         _upsert_full(event, doc)
+        INGESTION_EVENTS_TOTAL.labels(event_type=event_type, outcome="processed").inc()
 
     elif event_type == "PRICE_UPDATE":
         if event.get("price") is None:
+            INGESTION_EVENTS_TOTAL.labels(event_type=event_type, outcome="dlq").inc()
             logger.warning(
                 "Malformed PRICE_UPDATE — missing 'price' for id='%s'. Sending to DLQ.", product_id
             )
             _send_to_dlq(event, "missing 'price' field")
             return
         _update_price(event)
+        INGESTION_EVENTS_TOTAL.labels(event_type=event_type, outcome="processed").inc()
 
     else:
+        INGESTION_EVENTS_TOTAL.labels(event_type=event_type, outcome="skipped").inc()
         logger.warning(
             "Unknown eventType '%s' for id='%s'. Skipping.", event_type, product_id
         )
@@ -322,6 +457,8 @@ def process_event(event: dict) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
+    start_http_server(METRICS_PORT)
+    logger.info("Prometheus metrics server listening on port %d", METRICS_PORT)
     logger.info("Waiting %d s for Kafka to be ready …", KAFKA_READY_WAIT)
     time.sleep(KAFKA_READY_WAIT)
 
@@ -348,9 +485,17 @@ def main() -> None:
         except psycopg2.Error as exc:
             logger.error("DB error for product '%s': %s", event.get("id"), exc)
             conn.rollback()
+            INGESTION_EVENTS_TOTAL.labels(
+                event_type=(event.get("eventType") or "FULL_UPDATE").upper(),
+                outcome="db_error",
+            ).inc()
             _send_to_dlq(event, str(exc))
         except Exception as exc:
             logger.error("Unexpected error for product '%s': %s", event.get("id"), exc)
+            INGESTION_EVENTS_TOTAL.labels(
+                event_type=(event.get("eventType") or "FULL_UPDATE").upper(),
+                outcome="error",
+            ).inc()
             _send_to_dlq(event, str(exc))
 
 

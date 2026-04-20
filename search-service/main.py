@@ -84,9 +84,23 @@ from psycopg2 import pool as psycopg2_pool
 from contextlib import contextmanager, asynccontextmanager
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Histogram, generate_latest
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from sentence_transformers import SentenceTransformer
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+    _OTEL_AVAILABLE = True
+except ImportError:
+    _OTEL_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,6 +109,38 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
 )
+class _JsonLogFormatter(logging.Formatter):
+    """Emit structured JSON logs with trace/span correlation when available."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "service": "search-service",
+        }
+
+        otel_trace = globals().get("trace")
+        if otel_trace is not None:
+            try:
+                span = otel_trace.get_current_span()
+                ctx = span.get_span_context()
+                if ctx is not None and ctx.is_valid:
+                    payload["trace_id"] = format(ctx.trace_id, "032x")
+                    payload["span_id"] = format(ctx.span_id, "016x")
+            except Exception:
+                pass
+
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, ensure_ascii=True)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonLogFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 logger = logging.getLogger("search-service")
 
 # ---------------------------------------------------------------------------
@@ -106,7 +152,7 @@ SEARCH_DB_NAME     = os.environ.get("SEARCH_DB_NAME", "search_db")
 SEARCH_DB_USER     = os.environ.get("SEARCH_DB_USER", "postgres")
 SEARCH_DB_PASSWORD = os.environ["SEARCH_DB_PASSWORD"]
 
-EMBED_MODEL = "all-MiniLM-L6-v2"
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 # ── Kafka consumer configuration ─────────────────────────────────────────────
 # KAFKA_BOOTSTRAP_SERVERS is injected via env (see docker-compose.yml).
@@ -153,6 +199,12 @@ SEMANTIC_STRONG_ACCEPT  = 0.88
 SEMANTIC_BORDERLINE_LOW = 0.84
 SEMANTIC_MAX_CANDIDATES = 5
 
+# ── Cache eligibility (all phases) ──────────────────────────────────────────
+# Queries shorter than this are served directly from hybrid search and never
+# written to the cache. Single-char and tiny queries produce meaningless
+# embeddings that pollute the semantic candidate pool.
+MIN_CACHEABLE_QUERY_CHARS = 3
+
 # ── Phase 4: core search fields that trigger HARD_EXPIRED on FULL_UPDATE ────
 _CORE_SEARCH_FIELDS = frozenset({"title", "search_text", "brand", "category"})
 
@@ -166,10 +218,61 @@ _DB_DSN = (
 )
 
 # ---------------------------------------------------------------------------
+# Distributed tracing — initialised before model load and pool creation
+# ---------------------------------------------------------------------------
+class _NoOpSpan:
+    """Minimal no-op span used when OTel is unavailable."""
+    def set_attribute(self, *a, **kw): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+
+
+def _init_tracing() -> bool:
+    """
+    Set up OpenTelemetry tracing. Returns True if tracing is active.
+    A missing endpoint or ImportError leaves the service fully functional
+    with no-op spans — the search path is never blocked by tracing failures.
+    """
+    if not _OTEL_AVAILABLE:
+        logger.info("OTel packages not installed — tracing disabled")
+        return False
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    if not endpoint:
+        logger.info("OTEL_EXPORTER_OTLP_ENDPOINT not set — tracing disabled")
+        return False
+    try:
+        service_name = os.environ.get("OTEL_SERVICE_NAME", "search-service")
+        resource     = Resource({"service.name": service_name})
+        provider     = TracerProvider(resource=resource)
+        exporter     = OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces")
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        trace.set_tracer_provider(provider)
+        Psycopg2Instrumentor().instrument()
+        logger.info("OTel tracing enabled — endpoint=%s service=%s", endpoint, service_name)
+        return True
+    except Exception as exc:
+        logger.warning("OTel tracing init failed (non-fatal): %s", exc)
+        return False
+
+
+_tracing_enabled = _init_tracing()
+_tracer = trace.get_tracer("search-service") if _OTEL_AVAILABLE else None
+
+
+def _start_span(name: str):
+    """Return a real OTel span or a no-op when tracing is disabled."""
+    if _tracer is not None:
+        return _tracer.start_as_current_span(name)
+    return _NoOpSpan()
+
+
+# ---------------------------------------------------------------------------
 # Startup — load embedding model and connect to search-db (with retry)
 # ---------------------------------------------------------------------------
 logger.info("Loading embedding model '%s' …", EMBED_MODEL)
 model = SentenceTransformer(EMBED_MODEL)
+MODEL_EMBED_DIM = int(model.get_sentence_embedding_dimension())
+logger.info("Embedding model dimension resolved to %d", MODEL_EMBED_DIM)
 
 
 _db_pool: psycopg2_pool.ThreadedConnectionPool | None = None
@@ -194,6 +297,138 @@ def _init_pool() -> psycopg2_pool.ThreadedConnectionPool:
             logger.warning("Pool init attempt %d/10 failed: %s", attempt, exc)
             time.sleep(min(2 ** (attempt - 1), 30))
     raise RuntimeError("Could not initialise connection pool after 10 attempts")
+
+
+def _get_vector_dimension(cur, table_name: str, column_name: str) -> Optional[int]:
+    """
+    Return the pgvector dimension recorded in pg_attribute.atttypmod.
+    None means the column does not exist.
+    """
+    cur.execute(
+        """
+        SELECT atttypmod
+        FROM pg_attribute
+        WHERE attrelid = %s::regclass
+          AND attname   = %s
+          AND attnum    > 0
+        """,
+        (table_name, column_name),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def _rebuild_search_index_embeddings(conn) -> int:
+    """
+    Recompute search_index embeddings in place after a vector dimension change.
+    This is only used when the persisted schema does not match the loaded model.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT product_id, search_text FROM search_index ORDER BY product_id")
+        rows = cur.fetchall()
+
+    if not rows:
+        logger.info("search_index rebuild skipped — no rows found")
+        return 0
+
+    batch_size = 50
+    processed = 0
+    logger.warning(
+        "Rebuilding search_index embeddings for %d products with model '%s' (%d-dim)",
+        len(rows), EMBED_MODEL, MODEL_EMBED_DIM,
+    )
+
+    with conn.cursor() as cur:
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            texts = [r[1] for r in batch]
+            embeddings = model.encode(texts, batch_size=batch_size, show_progress_bar=False)
+            for (product_id, _), emb in zip(batch, embeddings):
+                cur.execute(
+                    "UPDATE search_index SET embedding = %s::vector WHERE product_id = %s",
+                    (_vec_str(emb.tolist()), product_id),
+                )
+            processed += len(batch)
+
+    logger.info("search_index embedding rebuild completed — processed=%d", processed)
+    return processed
+
+
+def _ensure_vector_schema_and_reset_semantic_cache() -> None:
+    """
+    Repair persisted pgvector schema drift against the currently loaded model.
+
+    Why this exists:
+      - init.sql only runs on first database initialization.
+      - when the search-db Docker volume already exists, switching from a
+        384-dim model to a 768-dim model leaves the old query_cache column in
+        place and semantic cache writes start failing.
+
+    Startup behavior:
+      - query_cache.query_embedding:
+        upgraded in place to the current model dimension when needed
+      - semantic cache state in query_cache:
+        cleared so stale semantic rows are rebuilt lazily on demand
+      - search_index.embedding:
+        if the persisted dimension is stale, rebuild all embeddings immediately
+    """
+    global _db_pool
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            qc_dim = _get_vector_dimension(cur, "query_cache", "query_embedding")
+            si_dim = _get_vector_dimension(cur, "search_index", "embedding")
+
+            if qc_dim is None:
+                cur.execute(f"ALTER TABLE query_cache ADD COLUMN query_embedding vector({MODEL_EMBED_DIM})")
+                qc_dim = MODEL_EMBED_DIM
+                logger.info("Added missing query_cache.query_embedding column with %d dimensions", MODEL_EMBED_DIM)
+
+            if qc_dim != MODEL_EMBED_DIM:
+                logger.warning(
+                    "query_cache.query_embedding dimension mismatch detected — db=%s model=%s; repairing schema",
+                    qc_dim, MODEL_EMBED_DIM,
+                )
+                cur.execute("ALTER TABLE query_cache DROP COLUMN IF EXISTS query_embedding")
+                cur.execute(f"ALTER TABLE query_cache ADD COLUMN query_embedding vector({MODEL_EMBED_DIM})")
+
+            cur.execute(
+                """
+                UPDATE query_cache
+                SET query_embedding        = NULL,
+                    semantic_source_query  = NULL,
+                    semantic_similarity    = NULL,
+                    semantic_meta          = NULL,
+                    semantic_cache_enabled = TRUE
+                WHERE query_embedding       IS NOT NULL
+                   OR semantic_source_query IS NOT NULL
+                   OR semantic_similarity   IS NOT NULL
+                   OR semantic_meta         IS NOT NULL
+                """
+            )
+            cleared_semantic_rows = cur.rowcount
+
+            if si_dim is None:
+                raise RuntimeError("search_index.embedding column is missing")
+
+            rebuild_count = 0
+            if si_dim != MODEL_EMBED_DIM:
+                logger.warning(
+                    "search_index.embedding dimension mismatch detected — db=%s model=%s; rebuilding embeddings",
+                    si_dim, MODEL_EMBED_DIM,
+                )
+                cur.execute("ALTER TABLE search_index DROP COLUMN IF EXISTS embedding")
+                cur.execute(f"ALTER TABLE search_index ADD COLUMN embedding vector({MODEL_EMBED_DIM})")
+                cur.execute("DROP INDEX IF EXISTS idx_search_embedding")
+                cur.execute(
+                    "CREATE INDEX idx_search_embedding ON search_index USING hnsw (embedding vector_cosine_ops)"
+                )
+                rebuild_count = _rebuild_search_index_embeddings(conn)
+
+        logger.info(
+            "Semantic cache reset completed — cleared_rows=%d search_index_rebuilt=%d",
+            cleared_semantic_rows,
+            rebuild_count,
+        )
 
 
 @contextmanager
@@ -232,6 +467,7 @@ async def lifespan(app: FastAPI):
     # Startup: initialise pool then start LISTEN daemon
     global _db_pool
     _db_pool = _init_pool()
+    _ensure_vector_schema_and_reset_semantic_cache()
     _start_invalidation_listener()
     _start_kafka_invalidation_consumer()
     _start_eureka_registration()
@@ -243,6 +479,8 @@ async def lifespan(app: FastAPI):
         logger.info("Connection pool closed")
 
 app = FastAPI(title="search-service", version="5.0.0", lifespan=lifespan)
+if _tracing_enabled and _OTEL_AVAILABLE:
+    FastAPIInstrumentor.instrument_app(app)
 
 # ---------------------------------------------------------------------------
 # Query normalisation
@@ -465,6 +703,17 @@ _metrics = _MetricsCounter({
     "cache_evictions_lru":       0,   # rows evicted by LRU pass in _l2_cleanup_expired
 })
 
+SEARCH_REQUESTS_TOTAL = Counter(
+    "search_requests_total",
+    "Total search requests by cache outcome.",
+    ["cache_hit_source"],
+)
+SEARCH_REQUEST_LATENCY_SECONDS = Histogram(
+    "search_request_latency_seconds",
+    "End-to-end latency for the search endpoint.",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+)
+
 
 def _l1_get(query_hash: str) -> Optional["_L1Entry"]:
     """
@@ -496,6 +745,70 @@ def _l1_get(query_hash: str) -> Optional["_L1Entry"]:
         return None
 
     return entry
+
+
+def _finalize_search_response(payload: dict, started_at: float) -> dict:
+    SEARCH_REQUESTS_TOTAL.labels(
+        cache_hit_source=payload.get("cache_hit_source", "UNKNOWN")
+    ).inc()
+    SEARCH_REQUEST_LATENCY_SECONDS.observe(time.monotonic() - started_at)
+    return payload
+
+
+class _SearchMetricsCollector:
+    """Expose in-memory cache counters and derived cache values to Prometheus."""
+
+    def collect(self):
+        counters = CounterMetricFamily(
+            "search_service_events_total",
+            "Application counters exposed from the in-memory search metrics map.",
+            labels=["metric"],
+        )
+        for key, value in _metrics.snapshot().items():
+            counters.add_metric([key], value)
+        yield counters
+
+        stats = {}
+        if _db_pool is not None:
+            try:
+                stats = cache_stats()
+            except Exception:
+                stats = {}
+        gauges = GaugeMetricFamily(
+            "search_service_values",
+            "Derived and configuration values from the search-service cache subsystem.",
+            labels=["metric"],
+        )
+        for key in (
+            "l1_size_active",
+            "l1_size_total",
+            "l1_ttl_seconds",
+            "l2_soft_ttl_seconds",
+            "l2_hard_ttl_seconds",
+            "query_cache_max_rows",
+            "adaptive_ttl_enabled",
+            "adaptive_ttl_ceiling_s",
+            "lexical_near_threshold",
+            "lexical_near_max_cands",
+            "lexical_near_min_tokens",
+            "semantic_strong_accept",
+            "semantic_borderline_low",
+            "semantic_max_candidates",
+            "total_requests",
+            "embedding_skips",
+            "cache_hit_rate",
+            "cold_entries",
+            "warm_entries",
+            "hot_entries",
+            "viral_entries",
+            "avg_soft_ttl_remaining_s",
+            "max_hit_count",
+        ):
+            value = stats.get(key)
+            if value is not None:
+                gauges.add_metric([key], float(value))
+        yield gauges
+
 
 
 def _l1_put(
@@ -1249,6 +1562,17 @@ def _eureka_registration_loop() -> None:
                         logger.warning("Eureka heartbeat 404 — re-registering")
                         continue
 
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404 and registered:
+                registered = False
+                logger.warning("Eureka heartbeat 404 — re-registering")
+                continue
+            logger.debug("Eureka %s error (non-fatal): %s",
+                         "registration" if not registered else "heartbeat", exc)
+            if not registered:
+                _eureka_stop.wait(backoff)
+                backoff = min(backoff * 2, 120)
+                continue
         except Exception as exc:
             logger.debug("Eureka %s error (non-fatal): %s",
                          "registration" if not registered else "heartbeat", exc)
@@ -1475,6 +1799,10 @@ def _accept_semantic_candidate(
         "candidate_normalized": candidate_normalized,
     }
 
+    if len(candidate_normalized) < MIN_CACHEABLE_QUERY_CHARS:
+        stats["reject_reason"] = "candidate_too_short"
+        return False, stats
+
     if similarity < SEMANTIC_BORDERLINE_LOW:
         stats["reject_reason"] = "low_similarity"
         return False, stats
@@ -1620,10 +1948,25 @@ def search(
 
     # ── Step 2: Empty query guard ────────────────────────────────────────────
     if not normalized:
-        return {"query": q, "total": 0, "results": [], "cache_hit_source": "EMPTY"}
+        return _finalize_search_response(
+            {"query": q, "total": 0, "results": [], "cache_hit_source": "EMPTY"},
+            t_start,
+        )
+
+    # ── Step 2b: Cache eligibility ───────────────────────────────────────────
+    # Very short queries (e.g. "c", "ab") produce near-meaningless embeddings
+    # that pollute the semantic candidate pool. Skip ALL cache tiers and go
+    # straight to hybrid search; do not write results back to the cache.
+    _cacheable = len(normalized) >= MIN_CACHEABLE_QUERY_CHARS
 
     # ── Step 3: L1 in-process cache ──────────────────────────────────────────
-    l1_entry = _l1_get(query_hash)
+    if not _cacheable:
+        l1_entry = None
+    with _start_span("cache.l1.lookup") as _sp:
+        l1_entry = _l1_get(query_hash)
+        _sp.set_attribute("cache.hit", l1_entry is not None)
+        if l1_entry is not None:
+            _sp.set_attribute("cache.freshness", l1_entry.freshness_status)
     if l1_entry is not None:
         _metrics.increment("l1_hits")
         eff = l1_entry.freshness_status     # ACTIVE or SOFT_EXPIRED (HARD_EXPIRED evicted)
@@ -1637,19 +1980,27 @@ def search(
         else:
             _metrics.increment("active_cache_hits")
 
-        docs       = _hydrate(l1_entry.ordered_product_ids)
+        with _start_span("search.hydrate") as _sp:
+            docs = _hydrate(l1_entry.ordered_product_ids)
+            _sp.set_attribute("hydrate.product_count", len(docs))
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
         logger.info(
             "Cache L1 HIT — normalized=%r hash=%.8s… freshness=%s results=%d latency_ms=%d",
             normalized, query_hash, eff, len(docs), elapsed_ms,
         )
-        return {
+        return _finalize_search_response({
             "query": q, "total": len(docs), "results": docs,
             "cache_hit_source": "L1", "freshness_status": eff,
-        }
+        }, t_start)
 
     # ── Step 4: L2 Postgres exact cache ──────────────────────────────────────
-    l2_result = _l2_get(query_hash, filter_hash, sort_key, page_number, page_limit)
+    if not _cacheable:
+        l2_result = None
+    with _start_span("cache.l2.lookup") as _sp:
+        l2_result = _l2_get(query_hash, filter_hash, sort_key, page_number, page_limit)
+        _sp.set_attribute("cache.hit", l2_result is not None)
+        if l2_result is not None:
+            _sp.set_attribute("cache.freshness", l2_result.freshness_status)
     if l2_result is not None:
         eff = l2_result.freshness_status    # ACTIVE or SOFT_EXPIRED
         if eff == "SOFT_EXPIRED":
@@ -1663,7 +2014,9 @@ def search(
             _metrics.increment("active_cache_hits")
         _metrics.increment("l2_hits")
 
-        docs = _hydrate(l2_result.ordered_product_ids)
+        with _start_span("search.hydrate") as _sp:
+            docs = _hydrate(l2_result.ordered_product_ids)
+            _sp.set_attribute("hydrate.product_count", len(docs))
         _l1_put(
             query_hash, l2_result.ordered_product_ids, len(docs), l2_result.response_meta,
             hard_expires_at=l2_result.hard_expires_at,
@@ -1674,262 +2027,284 @@ def search(
             "Cache L2 HIT — normalized=%r hash=%.8s… freshness=%s results=%d latency_ms=%d",
             normalized, query_hash, eff, len(docs), elapsed_ms,
         )
-        return {
+        return _finalize_search_response({
             "query": q, "total": len(docs), "results": docs,
             "cache_hit_source": "L2", "freshness_status": eff,
-        }
+        }, t_start)
 
     # ── Step 5: Lexical-near cache lookup ────────────────────────────────────
-    candidates = _lexical_near_get(
-        normalized, filter_hash, sort_key, page_number, page_limit
-    )
-    logger.info(
-        "Lexical-near candidates — normalized=%r count=%d",
-        normalized, len(candidates),
-    )
-
-    for candidate in candidates:
-        # Phase 4: compute effective freshness of this candidate before acceptance
-        cand_eff = _effective_freshness(
-            candidate.get("freshness_status", "ACTIVE"),
-            candidate.get("soft_expires_at"),
+    if not _cacheable:
+        candidates = []
+    with _start_span("cache.lexical_near.lookup") as _lex_sp:
+        candidates = _lexical_near_get(
+            normalized, filter_hash, sort_key, page_number, page_limit
         )
-        # HARD_EXPIRED candidates are skipped regardless of similarity
-        if cand_eff == "HARD_EXPIRED":
-            _metrics.increment("hard_expired_rejects")
-            continue
+        _lex_sp.set_attribute("cache.candidates_evaluated", len(candidates))
+        _lex_sp.set_attribute("cache.hit", False)
+        logger.info(
+            "Lexical-near candidates — normalized=%r count=%d",
+            normalized, len(candidates),
+        )
 
-        accepted, accept_stats = _accept_lexical_near_candidate(incoming_tokens, candidate)
-        if not accepted:
-            _metrics.increment("lexical_near_rejects")
+        for candidate in candidates:
+            # Phase 4: compute effective freshness of this candidate before acceptance
+            cand_eff = _effective_freshness(
+                candidate.get("freshness_status", "ACTIVE"),
+                candidate.get("soft_expires_at"),
+            )
+            # HARD_EXPIRED candidates are skipped regardless of similarity
+            if cand_eff == "HARD_EXPIRED":
+                _metrics.increment("hard_expired_rejects")
+                continue
+
+            accepted, accept_stats = _accept_lexical_near_candidate(incoming_tokens, candidate)
+            if not accepted:
+                _metrics.increment("lexical_near_rejects")
+                logger.info(
+                    "Lexical-near REJECT — normalized=%r candidate=%r "
+                    "trgm_score=%.4f reason=%s",
+                    normalized,
+                    candidate["normalized_query"],
+                    accept_stats.get("trgm_score", 0.0),
+                    accept_stats.get("reject_reason", "unknown"),
+                )
+                continue
+
+            _metrics.increment("lexical_near_hits")
+            if cand_eff == "SOFT_EXPIRED":
+                _metrics.increment("soft_expired_cache_hits")
+            else:
+                _metrics.increment("active_cache_hits")
+
+            ordered_ids  = list(candidate["ordered_product_ids"])
+            with _start_span("search.hydrate") as _sp:
+                docs = _hydrate(ordered_ids)
+                _sp.set_attribute("hydrate.product_count", len(docs))
+            response_meta = {
+                "cache_version":       2,
+                "cache_hit_source":    "LEXICAL_NEAR",
+                "source_query":        candidate["normalized_query"],
+                "lexical_similarity":  accept_stats["trgm_score"],
+                "shared_tokens":       accept_stats.get("shared_tokens", []),
+                "shared_count":        accept_stats.get("shared_count", 0),
+                "token_overlap_ratio": accept_stats.get("token_overlap_ratio", 0.0),
+            }
+
+            # Write-back: fresh ACTIVE entry for incoming query (bypasses lexical-near next time)
+            _l2_cleanup_expired()
+            _l2_put(
+                normalized, query_hash, filter_hash, sort_key,
+                page_number, page_limit,
+                ordered_ids, len(docs), response_meta,
+                query_tokens=incoming_tokens,
+                cache_version=2,
+            )
+            _l1_put(
+                query_hash, ordered_ids, len(docs), response_meta,
+                freshness_status="ACTIVE",
+            )
+
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
             logger.info(
-                "Lexical-near REJECT — normalized=%r candidate=%r "
-                "trgm_score=%.4f reason=%s",
+                "Cache LEXICAL_NEAR HIT — normalized=%r source=%r "
+                "trgm_score=%.4f cand_freshness=%s results=%d latency_ms=%d",
                 normalized,
                 candidate["normalized_query"],
-                accept_stats.get("trgm_score", 0.0),
-                accept_stats.get("reject_reason", "unknown"),
+                accept_stats["trgm_score"],
+                cand_eff,
+                len(docs),
+                elapsed_ms,
             )
-            continue
-
-        _metrics.increment("lexical_near_hits")
-        if cand_eff == "SOFT_EXPIRED":
-            _metrics.increment("soft_expired_cache_hits")
-        else:
-            _metrics.increment("active_cache_hits")
-
-        ordered_ids  = list(candidate["ordered_product_ids"])
-        docs         = _hydrate(ordered_ids)
-        response_meta = {
-            "cache_version":       2,
-            "cache_hit_source":    "LEXICAL_NEAR",
-            "source_query":        candidate["normalized_query"],
-            "lexical_similarity":  accept_stats["trgm_score"],
-            "shared_tokens":       accept_stats.get("shared_tokens", []),
-            "shared_count":        accept_stats.get("shared_count", 0),
-            "token_overlap_ratio": accept_stats.get("token_overlap_ratio", 0.0),
-        }
-
-        # Write-back: fresh ACTIVE entry for incoming query (bypasses lexical-near next time)
-        _l2_cleanup_expired()
-        _l2_put(
-            normalized, query_hash, filter_hash, sort_key,
-            page_number, page_limit,
-            ordered_ids, len(docs), response_meta,
-            query_tokens=incoming_tokens,
-            cache_version=2,
-        )
-        _l1_put(
-            query_hash, ordered_ids, len(docs), response_meta,
-            freshness_status="ACTIVE",
-        )
-
-        elapsed_ms = int((time.monotonic() - t_start) * 1000)
-        logger.info(
-            "Cache LEXICAL_NEAR HIT — normalized=%r source=%r "
-            "trgm_score=%.4f cand_freshness=%s results=%d latency_ms=%d",
-            normalized,
-            candidate["normalized_query"],
-            accept_stats["trgm_score"],
-            cand_eff,
-            len(docs),
-            elapsed_ms,
-        )
-        return {
-            "query": q, "total": len(docs), "results": docs,
-            "cache_hit_source": "LEXICAL_NEAR", "freshness_status": "ACTIVE",
-        }
+            _lex_sp.set_attribute("cache.hit", True)
+            return _finalize_search_response({
+                "query": q, "total": len(docs), "results": docs,
+                "cache_hit_source": "LEXICAL_NEAR", "freshness_status": "ACTIVE",
+            }, t_start)
 
     # ── Step 6: Compute embedding (once; shared for semantic + hybrid) ────────
     try:
-        t_embed   = time.monotonic()
-        embedding = model.encode(normalized).tolist()
-        vec_str   = _vec_str(embedding)
-        embed_ms  = int((time.monotonic() - t_embed) * 1000)
+        with _start_span("embedding.compute") as _sp:
+            _sp.set_attribute("embedding.model", EMBED_MODEL)
+            _sp.set_attribute("embedding.query", normalized)
+            t_embed   = time.monotonic()
+            embedding = model.encode(normalized).tolist()
+            vec_str   = _vec_str(embedding)
+            embed_ms  = int((time.monotonic() - t_embed) * 1000)
         _metrics.increment("embeddings_computed")
     except Exception as exc:
         logger.error("Embedding computation failed: %s", exc)
         raise HTTPException(status_code=503, detail="Embedding service unavailable")
 
     # ── Step 6 (cont): Semantic cache lookup ─────────────────────────────────
-    t_sem_lookup   = time.monotonic()
-    sem_candidates = _semantic_get(vec_str, filter_hash, sort_key, page_number, page_limit)
-    sem_lookup_ms  = int((time.monotonic() - t_sem_lookup) * 1000)
+    if not _cacheable:
+        sem_candidates = []
+    with _start_span("cache.semantic.lookup") as _sem_sp:
+        t_sem_lookup   = time.monotonic()
+        sem_candidates = _semantic_get(vec_str, filter_hash, sort_key, page_number, page_limit)
+        sem_lookup_ms  = int((time.monotonic() - t_sem_lookup) * 1000)
+        _sem_sp.set_attribute("cache.candidates_evaluated", len(sem_candidates))
+        _sem_sp.set_attribute("cache.hit", False)
 
-    logger.info(
-        "Semantic candidates — normalized=%r count=%d lookup_ms=%d",
-        normalized, len(sem_candidates), sem_lookup_ms,
-    )
-
-    for sem_candidate in sem_candidates:
-        _metrics.increment("semantic_candidates_seen")
-
-        # Phase 4: compute effective freshness of this semantic candidate
-        cand_eff = _effective_freshness(
-            sem_candidate.get("freshness_status", "ACTIVE"),
-            sem_candidate.get("soft_expires_at"),
+        logger.info(
+            "Semantic candidates — normalized=%r count=%d lookup_ms=%d",
+            normalized, len(sem_candidates), sem_lookup_ms,
         )
-        if cand_eff == "HARD_EXPIRED":
-            _metrics.increment("hard_expired_rejects")
-            continue
 
-        accepted, sem_stats = _accept_semantic_candidate(incoming_tokens, sem_candidate)
-        if not accepted:
-            _metrics.increment("semantic_rejects")
+        for sem_candidate in sem_candidates:
+            _metrics.increment("semantic_candidates_seen")
+
+            # Phase 4: compute effective freshness of this semantic candidate
+            cand_eff = _effective_freshness(
+                sem_candidate.get("freshness_status", "ACTIVE"),
+                sem_candidate.get("soft_expires_at"),
+            )
+            if cand_eff == "HARD_EXPIRED":
+                _metrics.increment("hard_expired_rejects")
+                continue
+
+            accepted, sem_stats = _accept_semantic_candidate(incoming_tokens, sem_candidate)
+            if not accepted:
+                _metrics.increment("semantic_rejects")
+                logger.info(
+                    "Semantic REJECT — normalized=%r candidate=%r semantic_similarity=%.4f reason=%s",
+                    normalized,
+                    sem_candidate["normalized_query"],
+                    sem_stats.get("similarity", 0.0),
+                    sem_stats.get("reject_reason", "unknown"),
+                )
+                continue
+
+            _metrics.increment("semantic_hits")
+            if cand_eff == "SOFT_EXPIRED":
+                _metrics.increment("soft_expired_cache_hits")
+            else:
+                _metrics.increment("active_cache_hits")
+
+            ordered_ids = list(sem_candidate["ordered_product_ids"])
+            with _start_span("search.hydrate") as _sp:
+                docs = _hydrate(ordered_ids)
+                _sp.set_attribute("hydrate.product_count", len(docs))
+
+            sem_meta = {
+                "source_query":  sem_candidate["normalized_query"],
+                "similarity":    sem_stats["similarity"],
+                "band":          sem_stats.get("band", "unknown"),
+                "shared_tokens": sem_stats.get("shared_tokens", []),
+                "shared_count":  sem_stats.get("shared_count", 0),
+                "lookup_ms":     sem_lookup_ms,
+            }
+            response_meta = {
+                "cache_version":       3,
+                "cache_hit_source":    "SEMANTIC",
+                "source_query":        sem_candidate["normalized_query"],
+                "semantic_similarity": sem_stats["similarity"],
+                "band":                sem_stats.get("band", "unknown"),
+            }
+
+            # Write-back: fresh ACTIVE entry for incoming query with its embedding
+            _l2_cleanup_expired()
+            _l2_put(
+                normalized, query_hash, filter_hash, sort_key,
+                page_number, page_limit,
+                ordered_ids, len(docs), response_meta,
+                query_tokens=incoming_tokens,
+                cache_version=3,
+                query_embedding_str=vec_str,
+                semantic_source_query=sem_candidate["normalized_query"],
+                semantic_similarity=sem_stats["similarity"],
+                semantic_meta=sem_meta,
+            )
+            _l1_put(
+                query_hash, ordered_ids, len(docs), response_meta,
+                freshness_status="ACTIVE",
+            )
+
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
             logger.info(
-                "Semantic REJECT — normalized=%r candidate=%r similarity=%.4f reason=%s",
+                "Cache SEMANTIC HIT — normalized=%r source=%r semantic_similarity=%.4f "
+                "band=%s cand_freshness=%s results=%d embed_ms=%d sem_lookup_ms=%d total_ms=%d",
                 normalized,
                 sem_candidate["normalized_query"],
-                sem_stats.get("similarity", 0.0),
-                sem_stats.get("reject_reason", "unknown"),
+                sem_stats["similarity"],
+                sem_stats.get("band", "unknown"),
+                cand_eff,
+                len(docs),
+                embed_ms,
+                sem_lookup_ms,
+                elapsed_ms,
             )
-            continue
-
-        _metrics.increment("semantic_hits")
-        if cand_eff == "SOFT_EXPIRED":
-            _metrics.increment("soft_expired_cache_hits")
-        else:
-            _metrics.increment("active_cache_hits")
-
-        ordered_ids = list(sem_candidate["ordered_product_ids"])
-        docs        = _hydrate(ordered_ids)
-
-        sem_meta = {
-            "source_query":  sem_candidate["normalized_query"],
-            "similarity":    sem_stats["similarity"],
-            "band":          sem_stats.get("band", "unknown"),
-            "shared_tokens": sem_stats.get("shared_tokens", []),
-            "shared_count":  sem_stats.get("shared_count", 0),
-            "lookup_ms":     sem_lookup_ms,
-        }
-        response_meta = {
-            "cache_version":       3,
-            "cache_hit_source":    "SEMANTIC",
-            "source_query":        sem_candidate["normalized_query"],
-            "semantic_similarity": sem_stats["similarity"],
-            "band":                sem_stats.get("band", "unknown"),
-        }
-
-        # Write-back: fresh ACTIVE entry for incoming query with its embedding
-        _l2_cleanup_expired()
-        _l2_put(
-            normalized, query_hash, filter_hash, sort_key,
-            page_number, page_limit,
-            ordered_ids, len(docs), response_meta,
-            query_tokens=incoming_tokens,
-            cache_version=3,
-            query_embedding_str=vec_str,
-            semantic_source_query=sem_candidate["normalized_query"],
-            semantic_similarity=sem_stats["similarity"],
-            semantic_meta=sem_meta,
-        )
-        _l1_put(
-            query_hash, ordered_ids, len(docs), response_meta,
-            freshness_status="ACTIVE",
-        )
-
-        elapsed_ms = int((time.monotonic() - t_start) * 1000)
-        logger.info(
-            "Cache SEMANTIC HIT — normalized=%r source=%r similarity=%.4f "
-            "band=%s cand_freshness=%s results=%d embed_ms=%d sem_lookup_ms=%d total_ms=%d",
-            normalized,
-            sem_candidate["normalized_query"],
-            sem_stats["similarity"],
-            sem_stats.get("band", "unknown"),
-            cand_eff,
-            len(docs),
-            embed_ms,
-            sem_lookup_ms,
-            elapsed_ms,
-        )
-        return {
-            "query": q, "total": len(docs), "results": docs,
-            "cache_hit_source": "SEMANTIC", "freshness_status": "ACTIVE",
-        }
+            _sem_sp.set_attribute("cache.hit", True)
+            return _finalize_search_response({
+                "query": q, "total": len(docs), "results": docs,
+                "cache_hit_source": "SEMANTIC", "freshness_status": "ACTIVE",
+            }, t_start)
 
     # ── Step 7: Cache miss — run full hybrid search ───────────────────────────
-    _metrics.increment("misses")
-    try:
-        t_search = time.monotonic()
-        with get_db_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(HYBRID_SQL, {
-                    "embedding": vec_str,
-                    "query":     normalized,
-                    "limit":     limit,
-                })
-                rows = cur.fetchall()
-        search_ms = int((time.monotonic() - t_search) * 1000)
+    with _start_span("search.hybrid") as _hyb_sp:
+        _metrics.increment("misses")
+        try:
+            t_search = time.monotonic()
+            with get_db_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(HYBRID_SQL, {
+                        "embedding": vec_str,
+                        "query":     normalized,
+                        "limit":     limit,
+                    })
+                    rows = cur.fetchall()
+            search_ms = int((time.monotonic() - t_search) * 1000)
 
-        ordered_ids  = [row["product_id"] for row in rows]
-        docs         = [row["denormalized_doc"] for row in rows]
-        result_count = len(docs)
+            ordered_ids  = [row["product_id"] for row in rows]
+            docs         = [row["denormalized_doc"] for row in rows]
+            result_count = len(docs)
+            _hyb_sp.set_attribute("search.results_count", result_count)
 
-        response_meta = {
-            "cache_version": 5,
-            "search_mode":   "hybrid",
-            "embed_ms":      embed_ms,
-            "search_ms":     search_ms,
-        }
+            response_meta = {
+                "cache_version": 5,
+                "search_mode":   "hybrid",
+                "embed_ms":      embed_ms,
+                "search_ms":     search_ms,
+            }
 
-        now_utc     = datetime.now(timezone.utc)
-        hard_exp_dt = now_utc + timedelta(seconds=L2_HARD_TTL_SECONDS)
+            now_utc     = datetime.now(timezone.utc)
+            hard_exp_dt = now_utc + timedelta(seconds=L2_HARD_TTL_SECONDS)
 
-        _l2_cleanup_expired()
-        _l2_put(
-            normalized, query_hash, filter_hash, sort_key,
-            page_number, page_limit,
-            ordered_ids, result_count, response_meta,
-            query_tokens=incoming_tokens,
-            cache_version=5,
-            query_embedding_str=vec_str,
-        )
-        _l1_put(
-            query_hash, ordered_ids, result_count, response_meta,
-            hard_expires_at=hard_exp_dt,
-            freshness_status="ACTIVE",
-        )
+            if _cacheable:
+                _l2_cleanup_expired()
+                _l2_put(
+                    normalized, query_hash, filter_hash, sort_key,
+                    page_number, page_limit,
+                    ordered_ids, result_count, response_meta,
+                    query_tokens=incoming_tokens,
+                    cache_version=5,
+                    query_embedding_str=vec_str,
+                )
+                _l1_put(
+                    query_hash, ordered_ids, result_count, response_meta,
+                    hard_expires_at=hard_exp_dt,
+                    freshness_status="ACTIVE",
+                )
 
-        elapsed_ms = int((time.monotonic() - t_start) * 1000)
-        logger.info(
-            "Cache MISS — normalized=%r hash=%.8s… results=%d "
-            "embed_ms=%d search_ms=%d total_ms=%d",
-            normalized, query_hash, result_count, embed_ms, search_ms, elapsed_ms,
-        )
-        return {
-            "query":            q,
-            "total":            result_count,
-            "results":          docs,
-            "cache_hit_source": "MISS",
-            "freshness_status": "ACTIVE",
-        }
+            elapsed_ms = int((time.monotonic() - t_start) * 1000)
+            logger.info(
+                "Cache MISS — normalized=%r hash=%.8s… results=%d "
+                "embed_ms=%d search_ms=%d total_ms=%d",
+                normalized, query_hash, result_count, embed_ms, search_ms, elapsed_ms,
+            )
+            return _finalize_search_response({
+                "query":            q,
+                "total":            result_count,
+                "results":          docs,
+                "cache_hit_source": "MISS",
+                "freshness_status": "ACTIVE",
+            }, t_start)
 
-    except psycopg2.Error as exc:
-        logger.error("DB error during search: %s", exc)
-        raise HTTPException(status_code=503, detail="Search temporarily unavailable")
-    except Exception as exc:
-        logger.error("Unexpected error during search: %s", exc)
-        raise HTTPException(status_code=500, detail="Internal search error")
+        except psycopg2.Error as exc:
+            logger.error("DB error during search: %s", exc)
+            raise HTTPException(status_code=503, detail="Search temporarily unavailable")
+        except Exception as exc:
+            logger.error("Unexpected error during search: %s", exc)
+            raise HTTPException(status_code=500, detail="Internal search error")
 
 
 @app.post("/internal/invalidate")
@@ -2047,3 +2422,11 @@ def cache_stats():
         # Adaptive TTL histogram (Phase 5)
         **ttl_histogram,
     }
+
+
+REGISTRY.register(_SearchMetricsCollector())
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)

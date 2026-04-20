@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  - job_name: spring-services
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - api-gateway:8080
+          - auth-service:8081
+          - cart-service:8082
+          - catalog-service:8083
+          - user-service:8084
+
+  - job_name: search-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["search-service:8085"]
+
+  - job_name: ingestion-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ingestion-worker:9108"]

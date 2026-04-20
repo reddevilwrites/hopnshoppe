@@ -12,7 +12,8 @@
       "Read(//cygdrive/c/Users/raymo/Documents/Upskill/Personal-Project/**)",
       "Bash(python search-service/test_pool_concurrency.py)",
       "Bash(python \"c:/Users/raymo/Documents/Upskill/Personal-Project/hopnshoppe/search-service/test_pool_concurrency.py\")",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d, indent=2\\)\\)\")"
     ]
   }
 }

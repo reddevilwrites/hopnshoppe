@@ -174,19 +174,17 @@
             <artifactId>micrometer-tracing-bridge-otel</artifactId>
         </dependency>
         <!--
-            opentelemetry-exporter-zipkin:
-              Ships completed spans to a Zipkin server over HTTP.
+            opentelemetry-exporter-otlp:
+              Ships completed spans to an OTLP collector over HTTP.
               Configure the endpoint in application.yml:
 
-                management.zipkin.tracing.endpoint=http://zipkin:9411/api/v2/spans
+                management.otlp.tracing.endpoint=http://otel-collector:4318/v1/traces
 
-              To send to a different backend (Jaeger, Tempo), swap this for
-              opentelemetry-exporter-otlp and update the endpoint accordingly.
               Version managed by spring-boot-dependencies BOM.
         -->
         <dependency>
             <groupId>io.opentelemetry</groupId>
-            <artifactId>opentelemetry-exporter-zipkin</artifactId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
         </dependency>
         <!--
             micrometer-registry-prometheus:

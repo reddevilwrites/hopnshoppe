@@ -4,3 +4,9 @@ psycopg2-binary==2.9.9
 sentence-transformers==3.1.1
 # kafka-python-ng: maintained fork of kafka-python with Python 3.12 support
 kafka-python-ng==2.2.3
+# OpenTelemetry — tracing pipeline; gated on OTEL_EXPORTER_OTLP_ENDPOINT env var
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-psycopg2
+prometheus-client==0.22.1

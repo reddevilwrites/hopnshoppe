@@ -9,8 +9,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Download the embedding model at build time.
 # - Avoids runtime network dependency (model is baked into the image)
 # - HF_HOME points to /app/models so the cache lands in a path we control
+# - EMBED_MODEL is a build arg so the model can be changed without touching code
+ARG EMBED_MODEL=BAAI/bge-base-en-v1.5
 ENV HF_HOME=/app/models
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+ENV EMBED_MODEL=${EMBED_MODEL}
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBED_MODEL}')"
 
 COPY main.py .
 

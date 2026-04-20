@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(python -c \":*)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('search-service/main.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('search-service/main.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c 'import yaml; yaml.safe_load\\(open\\('\\\\''__TRACKED_VAR__'\\\\''\\)\\); print\\('\\\\''OK: __TRACKED_VAR__'\\\\''\\)')",
+      "Bash(python -)",
+      "Bash(python _patch_spans.py)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('search-service/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('search-service/main.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ingestion-worker/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('ingestion-worker/main.py OK'\\)\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); traces=d.get\\('data',[]\\); print\\(f'Traces: {len\\(traces\\)}'\\); [print\\(f'  TraceID={t[\\\\\"traceID\\\\\"]} spans={len\\(t[\\\\\"spans\\\\\"]\\)} op={t[\\\\\"spans\\\\\"][0][\\\\\"operationName\\\\\"]}'\\) for t in traces[:5]]\")",
+      "Bash(xargs grep *)"
     ]
   }
 }

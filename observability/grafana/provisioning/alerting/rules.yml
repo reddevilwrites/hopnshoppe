@@ -1,0 +1,31 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: hopnshoppe-alerts
+    folder: HopnShoppe
+    interval: 1m
+    rules:
+      - uid: hopnshoppe-service-down
+        title: HopnShoppe Service Down
+        condition: A
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              editorMode: code
+              expr: up{job=~"spring-services|search-service|ingestion-worker"} == 0
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: Prometheus scrape target down
+        labels:
+          severity: warning

@@ -57,13 +57,35 @@ management:
   endpoints:
     web:
       exposure:
-        include: health, info, circuitbreakers
+        include: health, info, circuitbreakers, prometheus
   endpoint:
     health:
       show-details: always
       probes:
         enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://otel-collector:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
 
 logging:
+  include-application-name: false
+  pattern:
+    correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}] "
+  structured:
+    format:
+      console: ecs
+    ecs:
+      service:
+        environment: ${DEPLOYMENT_ENV:dev}
+        version: ${APP_VERSION:0.0.1-SNAPSHOT}
   level:
     com.hopnshoppe.auth: DEBUG

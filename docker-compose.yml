@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ---------------------------------------------------------------------------
   # auth-db — dedicated Postgres instance for auth-service (auth_db)
@@ -31,6 +29,95 @@ services:
       - "5433:5432"
     volumes:
       - pgdata-user:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry Collector — single ingest point for app traces.
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    container_name: hopnshoppe-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+
+  tempo:
+    image: grafana/tempo:2.7.2
+    container_name: hopnshoppe-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: hopnshoppe-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+
+  loki:
+    image: grafana/loki:3.4.2
+    container_name: hopnshoppe-loki
+    command: ["-config.file=/etc/loki/config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:3.4.2
+    container_name: hopnshoppe-promtail
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      loki:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: hopnshoppe-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.2
+    container_name: hopnshoppe-cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
 
   # ---------------------------------------------------------------------------
   # Service Registry — all services register here; gateway resolves lb:// URIs
@@ -91,6 +178,10 @@ services:
       SPRING_CLOUD_CONFIG_URI: http://config-server:8888
       EUREKA_URI: http://discovery-server:8761/eureka/
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
+      APP_VERSION: 0.0.1-SNAPSHOT
+      DEPLOYMENT_ENV: dev
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev,service.version=0.0.1-SNAPSHOT
     ports:
       - "8081:8081"
     healthcheck:
@@ -123,6 +214,10 @@ services:
       SPRING_CLOUD_CONFIG_URI: http://config-server:8888
       EUREKA_URI: http://discovery-server:8761/eureka/
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
+      APP_VERSION: 0.0.1-SNAPSHOT
+      DEPLOYMENT_ENV: dev
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev,service.version=0.0.1-SNAPSHOT
     ports:
       - "8084:8084"
     healthcheck:
@@ -146,6 +241,10 @@ services:
     environment:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
       EUREKA_URI: http://discovery-server:8761/eureka/
+      APP_VERSION: 0.0.1-SNAPSHOT
+      DEPLOYMENT_ENV: dev
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev,service.version=0.0.1-SNAPSHOT
     ports:
       - "8080:8080"
     healthcheck:
@@ -224,6 +323,10 @@ services:
       SPRING_CLOUD_CONFIG_URI: http://config-server:8888
       EUREKA_URI: http://discovery-server:8761/eureka/
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      APP_VERSION: 0.0.1-SNAPSHOT
+      DEPLOYMENT_ENV: dev
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev,service.version=0.0.1-SNAPSHOT
     ports:
       - "8083:8083"
     healthcheck:
@@ -266,7 +369,10 @@ services:
   # Failed writes are routed to product-updates.DLQ.
   # ---------------------------------------------------------------------------
   ingestion-worker:
-    build: ./ingestion-worker
+    build:
+      context: ./ingestion-worker
+      args:
+        EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-base-en-v1.5}
     container_name: hopnshoppe-ingestion-worker
     depends_on:
       kafka:
@@ -279,6 +385,14 @@ services:
       SEARCH_DB_NAME: search_db
       SEARCH_DB_USER: ${POSTGRES_USER:-postgres}
       SEARCH_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
+      APP_VERSION: 0.0.1-SNAPSHOT
+      DEPLOYMENT_ENV: dev
+      METRICS_PORT: 9108
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev,service.version=0.0.1-SNAPSHOT
+      OTEL_SERVICE_NAME: ingestion-worker
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-base-en-v1.5}
     restart: on-failure
 
   # ---------------------------------------------------------------------------
@@ -287,7 +401,10 @@ services:
   # Returns denormalized product docs directly; no catalog-service call per result.
   # ---------------------------------------------------------------------------
   search-service:
-    build: ./search-service
+    build:
+      context: ./search-service
+      args:
+        EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-base-en-v1.5}
     container_name: hopnshoppe-search-service
     depends_on:
       discovery-server:
@@ -303,6 +420,13 @@ services:
       SEARCH_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       EUREKA_URI: http://discovery-server:8761/eureka/
+      APP_VERSION: 0.0.1-SNAPSHOT
+      DEPLOYMENT_ENV: dev
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev,service.version=0.0.1-SNAPSHOT
+      OTEL_SERVICE_NAME: search-service
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-base-en-v1.5}
     ports:
       - "8085:8085"
     restart: on-failure
@@ -336,6 +460,10 @@ services:
       EUREKA_URI: http://discovery-server:8761/eureka/
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET not set}
       CATALOG_SERVICE_URL: http://catalog-service:8083
+      APP_VERSION: 0.0.1-SNAPSHOT
+      DEPLOYMENT_ENV: dev
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev,service.version=0.0.1-SNAPSHOT
     ports:
       - "8082:8082"
     healthcheck:
@@ -364,3 +492,7 @@ volumes:
   pgdata-cart:
   pgdata-search:
   kafka-data:
+  grafana-data:
+  prometheus-data:
+  loki-data:
+  tempo-data:

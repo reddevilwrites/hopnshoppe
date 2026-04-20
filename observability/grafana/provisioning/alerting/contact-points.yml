@@ -1,0 +1,10 @@
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: grafana-default-email
+    receivers:
+      - uid: grafana-default-email-receiver
+        type: email
+        settings:
+          addresses: devnull@example.com

@@ -1,0 +1,47 @@
+groups:
+  - name: hopnshoppe-observability
+    rules:
+      - alert: HopnShoppeServiceDown
+        expr: up{job=~"spring-services|search-service|ingestion-worker"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Service scrape target down"
+          description: "Prometheus has not been able to scrape {{ $labels.instance }} for 2 minutes."
+
+      - alert: HopnShoppeHighErrorRate
+        expr: sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m])) / clamp_min(sum(rate(http_server_requests_seconds_count[5m])), 1) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High 5xx error rate"
+          description: "More than 5% of Spring HTTP requests are returning 5xx responses."
+
+      - alert: HopnShoppeSearchMissSpike
+        expr: rate(search_service_events_total{metric="misses"}[10m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Search cache miss spike"
+          description: "search-service is missing cache more frequently than expected."
+
+      - alert: HopnShoppeSearchHighLatency
+        expr: histogram_quantile(0.95, sum(rate(search_request_latency_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Search p95 latency is elevated"
+          description: "The search-service p95 latency has stayed above 1 second for 10 minutes."
+
+      - alert: HopnShoppeIngestionDbDisconnected
+        expr: ingestion_worker_db_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingestion worker lost database connectivity"
+          description: "ingestion-worker is up but no longer reports an active DB connection."

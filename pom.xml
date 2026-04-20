@@ -14,7 +14,7 @@
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.4.5</version>
+        <version>3.5.13</version>
         <relativePath/>
     </parent>
 
@@ -47,7 +47,7 @@
 
     <properties>
         <java.version>17</java.version>
-        <spring-cloud.version>2024.0.1</spring-cloud.version>
+        <spring-cloud.version>2025.0.2</spring-cloud.version>
         <!--
             JJWT is NOT managed by spring-boot-dependencies, so we centralise
             the version here so all services stay in sync.

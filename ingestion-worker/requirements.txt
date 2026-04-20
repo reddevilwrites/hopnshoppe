@@ -3,3 +3,9 @@ kafka-python-ng==2.2.3
 sentence-transformers==3.1.1
 psycopg2-binary==2.9.9
 beautifulsoup4==4.12.3
+# OpenTelemetry — tracing pipeline; gated on OTEL_EXPORTER_OTLP_ENDPOINT env var
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-psycopg2
+opentelemetry-instrumentation-kafka-python
+prometheus-client==0.22.1
